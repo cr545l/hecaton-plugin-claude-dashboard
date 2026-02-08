@@ -254,7 +254,7 @@ function render(state) {
   lines.push('');
   lines.push(centerText(
     colors.title + ansi.bold + ' Claude Dashboard ' + ansi.reset +
-    colors.dim + 'v1.0' + ansi.reset,
+    colors.dim + 'v1.0.1' + ansi.reset,
     width
   ));
   lines.push('');
