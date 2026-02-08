@@ -37,22 +37,20 @@ const ansi = {
   moveTo: (row, col) => `${CSI}${row};${col}H`,
 };
 
-// Color palette
+// Color palette (Claude brand: coral/terracotta)
 const colors = {
-  bg: ansi.bg(15, 20, 45),
-  bgDark: ansi.bg(10, 14, 32),
-  title: ansi.fg(120, 180, 255),
+  bg: ansi.bg(30, 16, 12),
+  title: ansi.fg(215, 105, 70),
   label: ansi.fg(180, 180, 200),
   value: ansi.fg(255, 255, 255),
-  dim: ansi.fg(100, 100, 120),
+  dim: ansi.fg(120, 100, 95),
   green: ansi.fg(120, 220, 150),
   yellow: ansi.fg(230, 200, 100),
   red: ansi.fg(230, 110, 110),
   cyan: ansi.fg(100, 200, 230),
   orange: ansi.fg(230, 170, 100),
-  pink: ansi.fg(230, 150, 180),
-  border: ansi.fg(60, 70, 100),
-  separator: ansi.fg(50, 55, 80),
+  border: ansi.fg(100, 55, 45),
+  separator: ansi.fg(75, 45, 38),
 };
 
 function colorForPercent(pct) {
@@ -249,7 +247,7 @@ function drawSeparator(width) {
 
 function render(state) {
   const { cols, rows } = getTermSize();
-  const width = Math.min(cols, 78);
+  const width = Math.min(cols, 72);
   const lines = [];
 
   // Title
@@ -274,15 +272,14 @@ function render(state) {
     const effortMap = { high: 'H', medium: 'M', low: 'L' };
     const effortLabel = effortMap[state.effort] || 'H';
     lines.push(
-      '  ' + colors.cyan + '\u{1F916}' + ansi.reset + ' ' +
-      colors.label + 'Model: ' + ansi.reset +
+      '  ' + colors.label + 'Model: ' + ansi.reset +
       colors.value + ansi.bold + (state.effort !== 'high' ? `[${effortLabel}] ` : '') + 'Claude' + ansi.reset
     );
     lines.push('');
 
     // ── Rate Limits ──
     lines.push('  ' + colors.title + ansi.bold + 'Rate Limits' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 2));
+    lines.push('  ' + drawSeparator(width - 3));
 
     if (data) {
       // 5-hour
@@ -322,7 +319,7 @@ function render(state) {
         lines.push('  ' + colors.dim + 'No rate limit data available' + ansi.reset);
       }
     } else {
-      lines.push('  ' + colors.yellow + '\u26A0 Failed to fetch rate limits' + ansi.reset);
+      lines.push('  ' + colors.yellow + 'Failed to fetch rate limits' + ansi.reset);
       lines.push('  ' + colors.dim + 'Check ~/.claude/.credentials.json' + ansi.reset);
     }
 
@@ -330,7 +327,7 @@ function render(state) {
 
     // ── Session Info ──
     lines.push('  ' + colors.title + ansi.bold + 'Session' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 2));
+    lines.push('  ' + drawSeparator(width - 3));
 
     const elapsed = Date.now() - state.startTime;
     lines.push(
@@ -353,7 +350,7 @@ function render(state) {
 
     // ── Plan Info ──
     lines.push('  ' + colors.title + ansi.bold + 'Account' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 2));
+    lines.push('  ' + drawSeparator(width - 3));
     lines.push(
       '  ' + colors.label + 'Plan: ' + ansi.reset +
       colors.value + (state.config.plan === 'max' ? 'Max' : 'Pro') + ansi.reset
@@ -362,7 +359,7 @@ function render(state) {
     lines.push('');
 
     // ── Keyboard ──
-    lines.push('  ' + drawSeparator(width - 2));
+    lines.push('  ' + drawSeparator(width - 3));
     lines.push(
       '  ' + colors.dim +
       '[r] Refresh  [ESC] Close  [1] Compact  [2] Normal  [3] Detailed' +
