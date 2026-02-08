@@ -1,0 +1,15 @@
+{
+  "id": "claude-dashboard",
+  "name": "Claude Dashboard",
+  "version": "1.0.0",
+  "entry": "main.js",
+  "runtime": "node",
+  "apiVersion": { "major": 1, "minor": 0 },
+  "shortcut": { "key": "D", "mod": "ctrl+shift" },
+  "overlay": {
+    "mode": "floating",
+    "width": "70%",
+    "height": "70%",
+    "z_order": 50
+  }
+}
