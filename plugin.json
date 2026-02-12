@@ -1,7 +1,7 @@
 {
   "id": "claude-dashboard",
   "name": "Claude Dashboard",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "entry": "main.js",
   "runtime": "node",
   "apiVersion": { "major": 1, "minor": 0 },
