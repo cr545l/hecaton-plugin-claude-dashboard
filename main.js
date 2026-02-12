@@ -203,6 +203,7 @@ function formatResetTime(resetAt) {
 // Dynamic terminal size (updated by host resize notifications)
 let termCols = parseInt(process.env.HECA_COLS || '80', 10);
 let termRows = parseInt(process.env.HECA_ROWS || '24', 10);
+let clickableAreas = [];
 
 function getTermSize() {
   return { cols: termCols, rows: termRows };
@@ -249,6 +250,7 @@ function render(state) {
   const { cols, rows } = getTermSize();
   const width = Math.min(cols, 72);
   const lines = [];
+  let buttonLineIdx = -1;
 
   // Title
   lines.push('');
@@ -262,6 +264,7 @@ function render(state) {
   if (state.error) {
     lines.push(centerText(colors.red + state.error + ansi.reset, width));
     lines.push('');
+    buttonLineIdx = lines.length;
     lines.push(centerText(colors.dim + '[r] Refresh  [ESC] Close' + ansi.reset, width));
   } else if (state.loading) {
     lines.push(centerText(colors.dim + 'Loading...' + ansi.reset, width));
@@ -360,6 +363,7 @@ function render(state) {
 
     // ── Keyboard ──
     lines.push('  ' + drawSeparator(width - 3));
+    buttonLineIdx = lines.length;
     lines.push(
       '  ' + colors.dim +
       '[r] Refresh  [ESC] Close  [1] Compact  [2] Normal  [3] Detailed' +
@@ -377,6 +381,32 @@ function render(state) {
   const startCol = Math.max(1, Math.floor((cols - width) / 2));
   for (let i = 0; i < boxed.length; i++) {
     process.stdout.write(ansi.moveTo(startRow + i, startCol) + colors.bg + boxed[i] + ansi.reset);
+  }
+
+  // Record clickable areas for mouse support
+  clickableAreas = [];
+  if (buttonLineIdx >= 0) {
+    const screenRow = startRow + buttonLineIdx + 1; // +1 for box top border
+    const contentStart = startCol + 2; // after │ and space in box
+    const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
+    const buttonDefs = [
+      { label: '[r] Refresh', action: 'refresh' },
+      { label: '[ESC] Close', action: 'close' },
+      { label: '[1] Compact', action: 'mode1' },
+      { label: '[2] Normal', action: 'mode2' },
+      { label: '[3] Detailed', action: 'mode3' },
+    ];
+    for (const btn of buttonDefs) {
+      const idx = plainLine.indexOf(btn.label);
+      if (idx >= 0) {
+        clickableAreas.push({
+          row: screenRow,
+          colStart: contentStart + idx,
+          colEnd: contentStart + idx + btn.label.length - 1,
+          action: btn.action,
+        });
+      }
+    }
   }
 }
 
@@ -470,6 +500,40 @@ async function main() {
       } catch { /* ignore parse errors */ }
       return;
     }
+
+    // Handle SGR mouse sequences: ESC [ < Cb ; Cx ; Cy M/m
+    const mouseRegex = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+    let mouseMatch;
+    let hadMouse = false;
+    while ((mouseMatch = mouseRegex.exec(key)) !== null) {
+      hadMouse = true;
+      const cb = parseInt(mouseMatch[1], 10);
+      const cx = parseInt(mouseMatch[2], 10);
+      const cy = parseInt(mouseMatch[3], 10);
+      const isPress = mouseMatch[4] === 'M';
+      if (!isPress) continue;
+
+      // Scroll wheel up → refresh
+      if (cb === 64) { await refresh(); continue; }
+      if (cb === 65) continue; // scroll down → ignore
+
+      // Left click → check clickable areas
+      if (cb === 0) {
+        for (const area of clickableAreas) {
+          if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
+            switch (area.action) {
+              case 'refresh': await refresh(); break;
+              case 'close': cleanup(); sendRpc('close'); break;
+              case 'mode1': state.config.displayMode = 'compact'; render(state); break;
+              case 'mode2': state.config.displayMode = 'normal'; render(state); break;
+              case 'mode3': state.config.displayMode = 'detailed'; render(state); break;
+            }
+            break;
+          }
+        }
+      }
+    }
+    if (hadMouse) return;
 
     switch (key) {
       case 'r':
