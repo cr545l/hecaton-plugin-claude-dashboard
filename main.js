@@ -204,6 +204,18 @@ function formatResetTime(resetAt) {
 let termCols = parseInt(process.env.HECA_COLS || '80', 10);
 let termRows = parseInt(process.env.HECA_ROWS || '24', 10);
 let clickableAreas = [];
+let hoveredAreaIndex = -1;
+let currentButtons = [];
+
+function buildHintText(buttons) {
+  let result = '';
+  for (let i = 0; i < buttons.length; i++) {
+    if (i > 0) result += '  ';
+    const color = (i === hoveredAreaIndex) ? colors.value + ansi.bold : colors.dim;
+    result += color + buttons[i].label + ansi.reset;
+  }
+  return result;
+}
 
 function getTermSize() {
   return { cols: termCols, rows: termRows };
@@ -251,6 +263,7 @@ function render(state) {
   const width = Math.min(cols, 72);
   const lines = [];
   let buttonLineIdx = -1;
+  currentButtons = [];
 
   // Title
   lines.push('');
@@ -264,8 +277,9 @@ function render(state) {
   if (state.error) {
     lines.push(centerText(colors.red + state.error + ansi.reset, width));
     lines.push('');
+    currentButtons = [{ label: '[r] Refresh', action: 'refresh' }];
     buttonLineIdx = lines.length;
-    lines.push(centerText(colors.dim + '[r] Refresh  [ESC] Close' + ansi.reset, width));
+    lines.push(centerText(buildHintText(currentButtons), width));
   } else if (state.loading) {
     lines.push(centerText(colors.dim + 'Loading...' + ansi.reset, width));
   } else {
@@ -363,12 +377,14 @@ function render(state) {
 
     // ── Keyboard ──
     lines.push('  ' + drawSeparator(width - 3));
+    currentButtons = [
+      { label: '[r] Refresh', action: 'refresh' },
+      { label: '[1] Compact', action: 'mode1' },
+      { label: '[2] Normal', action: 'mode2' },
+      { label: '[3] Detailed', action: 'mode3' },
+    ];
     buttonLineIdx = lines.length;
-    lines.push(
-      '  ' + colors.dim +
-      '[r] Refresh  [ESC] Close  [1] Compact  [2] Normal  [3] Detailed' +
-      ansi.reset
-    );
+    lines.push('  ' + buildHintText(currentButtons));
   }
 
   lines.push('');
@@ -385,18 +401,11 @@ function render(state) {
 
   // Record clickable areas for mouse support
   clickableAreas = [];
-  if (buttonLineIdx >= 0) {
+  if (buttonLineIdx >= 0 && currentButtons.length > 0) {
     const screenRow = startRow + buttonLineIdx + 1; // +1 for box top border
     const contentStart = startCol + 2; // after │ and space in box
     const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
-    const buttonDefs = [
-      { label: '[r] Refresh', action: 'refresh' },
-      { label: '[ESC] Close', action: 'close' },
-      { label: '[1] Compact', action: 'mode1' },
-      { label: '[2] Normal', action: 'mode2' },
-      { label: '[3] Detailed', action: 'mode3' },
-    ];
-    for (const btn of buttonDefs) {
+    for (const btn of currentButtons) {
       const idx = plainLine.indexOf(btn.label);
       if (idx >= 0) {
         clickableAreas.push({
@@ -408,6 +417,7 @@ function render(state) {
       }
     }
   }
+  if (hoveredAreaIndex >= clickableAreas.length) hoveredAreaIndex = -1;
 }
 
 // ============================================================
@@ -510,8 +520,26 @@ async function main() {
       const cb = parseInt(mouseMatch[1], 10);
       const cx = parseInt(mouseMatch[2], 10);
       const cy = parseInt(mouseMatch[3], 10);
-      const isPress = mouseMatch[4] === 'M';
-      if (!isPress) continue;
+      const isRelease = mouseMatch[4] === 'm';
+
+      // Motion events (cb bit 5 set)
+      if ((cb & 32) !== 0) {
+        let newHover = -1;
+        for (let i = 0; i < clickableAreas.length; i++) {
+          const area = clickableAreas[i];
+          if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
+            newHover = i;
+            break;
+          }
+        }
+        if (newHover !== hoveredAreaIndex) {
+          hoveredAreaIndex = newHover;
+          render(state);
+        }
+        continue;
+      }
+
+      if (isRelease) continue;
 
       // Scroll wheel up → refresh
       if (cb === 64) { await refresh(); continue; }
@@ -523,7 +551,6 @@ async function main() {
           if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
             switch (area.action) {
               case 'refresh': await refresh(); break;
-              case 'close': cleanup(); sendRpc('close'); break;
               case 'mode1': state.config.displayMode = 'compact'; render(state); break;
               case 'mode2': state.config.displayMode = 'normal'; render(state); break;
               case 'mode3': state.config.displayMode = 'detailed'; render(state); break;
