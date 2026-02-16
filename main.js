@@ -258,6 +258,44 @@ function drawSeparator(width) {
   return colors.separator + '\u2500'.repeat(width - 2) + ansi.reset;
 }
 
+function renderMinimized(state) {
+  const { cols } = getTermSize();
+  const data = state.data;
+  let line = '';
+
+  // Build: " Claude | 5h: 45% ██████░░░░ | 7d: 23% ████░░░░░░ | ↻ 42s"
+  line += colors.title + ansi.bold + ' Claude' + ansi.reset;
+
+  if (data) {
+    if (data.five_hour) {
+      const pct = Math.round(data.five_hour.utilization);
+      line += colors.dim + ' | ' + ansi.reset;
+      line += colors.label + '5h: ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+    }
+    if (data.seven_day) {
+      const pct = Math.round(data.seven_day.utilization);
+      line += colors.dim + ' | ' + ansi.reset;
+      line += colors.label + '7d: ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+    }
+  }
+
+  if (state.lastRefresh) {
+    const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
+    line += colors.dim + ' | ' + ansi.reset;
+    line += colors.dim + '\u21bb ' + ago + 's' + ansi.reset;
+  }
+
+  // Pad/truncate to terminal width
+  const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  const pad = Math.max(0, cols - plain.length);
+  line += ' '.repeat(pad);
+
+  process.stdout.write(ansi.clear + ansi.hideCursor);
+  process.stdout.write(ansi.moveTo(1, 1) + line + ansi.reset);
+}
+
 function render(state) {
   const { cols, rows } = getTermSize();
   const width = Math.min(cols, 72);
@@ -443,6 +481,7 @@ async function main() {
     startTime: Date.now(),
     lastRefresh: null,
     refreshCount: 0,
+    minimized: false,
   };
 
   // Initial render
@@ -453,17 +492,22 @@ async function main() {
   state.effort = await getEffortLevel();
 
   // Fetch data
+  function rerender() {
+    if (state.minimized) renderMinimized(state);
+    else render(state);
+  }
+
   async function refresh() {
     state.loading = true;
     state.error = null;
-    render(state);
+    rerender();
 
     try {
       const token = await getCredentials();
       if (!token) {
         state.error = 'No credentials found';
         state.loading = false;
-        render(state);
+        rerender();
         return;
       }
       const data = await fetchUsageLimits(token);
@@ -471,11 +515,11 @@ async function main() {
       state.loading = false;
       state.lastRefresh = Date.now();
       state.refreshCount++;
-      render(state);
+      rerender();
     } catch (e) {
       state.error = 'Failed to fetch: ' + (e.message || 'unknown error');
       state.loading = false;
-      render(state);
+      rerender();
     }
   }
 
@@ -505,6 +549,15 @@ async function main() {
         if (json.method === 'resize' && json.params) {
           termCols = json.params.cols || termCols;
           termRows = json.params.rows || termRows;
+          if (state.minimized) renderMinimized(state);
+          else render(state);
+        }
+        if (json.method === 'minimize') {
+          state.minimized = true;
+          renderMinimized(state);
+        }
+        if (json.method === 'restore') {
+          state.minimized = false;
           render(state);
         }
       } catch { /* ignore parse errors */ }
