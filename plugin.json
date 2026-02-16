@@ -10,6 +10,8 @@
     "mode": "floating",
     "width": "70%",
     "height": "70%",
-    "z_order": 50
+    "z_order": 50,
+    "resizable": false,
+    "bordered": false
   }
 }
