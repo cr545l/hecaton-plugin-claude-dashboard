@@ -263,13 +263,9 @@ function renderMinimized(state) {
   const data = state.data;
   let line = '';
 
-  // Build: " Claude | 5h: 45% ██████░░░░ | 7d: 23% ████░░░░░░ | ↻ 42s"
-  line += colors.title + ansi.bold + ' Claude' + ansi.reset;
-
   if (data) {
     if (data.five_hour) {
       const pct = Math.round(data.five_hour.utilization);
-      line += colors.dim + ' | ' + ansi.reset;
       line += colors.label + '5h: ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
     }
@@ -542,25 +538,31 @@ async function main() {
   process.stdin.setEncoding('utf-8');
 
   process.stdin.on('data', async (key) => {
-    // Check for RPC message from host
-    if (key.startsWith('__HECA_RPC__')) {
-      try {
-        const json = JSON.parse(key.slice(12).trim());
-        if (json.method === 'resize' && json.params) {
-          termCols = json.params.cols || termCols;
-          termRows = json.params.rows || termRows;
-          if (state.minimized) renderMinimized(state);
-          else render(state);
-        }
-        if (json.method === 'minimize') {
-          state.minimized = true;
-          renderMinimized(state);
-        }
-        if (json.method === 'restore') {
-          state.minimized = false;
-          render(state);
-        }
-      } catch { /* ignore parse errors */ }
+    // Host RPC – multiple RPCs can arrive in a single pipe read, so split
+    // and process each one separately.
+    if (key.indexOf('__HECA_RPC__') !== -1) {
+      const segments = key.split('__HECA_RPC__');
+      for (const seg of segments) {
+        const trimmed = seg.trim();
+        if (!trimmed) continue;
+        try {
+          const json = JSON.parse(trimmed);
+          if (json.method === 'resize' && json.params) {
+            termCols = json.params.cols || termCols;
+            termRows = json.params.rows || termRows;
+            if (state.minimized) renderMinimized(state);
+            else render(state);
+          }
+          if (json.method === 'minimize') {
+            state.minimized = true;
+            renderMinimized(state);
+          }
+          if (json.method === 'restore') {
+            state.minimized = false;
+            render(state);
+          }
+        } catch { /* ignore malformed segment */ }
+      }
       return;
     }
 

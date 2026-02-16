@@ -12,6 +12,8 @@
     "height": "70%",
     "z_order": 50,
     "resizable": false,
-    "bordered": false
+    "bordered": false,
+    "minimized_label": "Claude",
+    "minimized_label_color": "#D76946"
   }
 }
