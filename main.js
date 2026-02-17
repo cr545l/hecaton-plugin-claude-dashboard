@@ -178,8 +178,10 @@ function formatTokens(tokens) {
 
 function formatDuration(ms) {
   const totalSec = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSec / 3600);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
   const minutes = Math.floor((totalSec % 3600) / 60);
+  if (days > 0) return `${days}d${hours > 0 ? hours + 'h' : ''}`;
   if (hours > 0) return `${hours}h${minutes > 0 ? minutes + 'm' : ''}`;
   return `${minutes}m`;
 }
@@ -266,13 +268,15 @@ function renderMinimized(state) {
   if (data) {
     if (data.five_hour) {
       const pct = Math.round(data.five_hour.utilization);
-      line += colors.label + '5h: ' + ansi.reset;
+      const reset = formatResetTime(data.five_hour.resets_at);
+      line += colors.label + (reset || '5h') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
     }
     if (data.seven_day) {
       const pct = Math.round(data.seven_day.utilization);
+      const reset = formatResetTime(data.seven_day.resets_at);
       line += colors.dim + ' | ' + ansi.reset;
-      line += colors.label + '7d: ' + ansi.reset;
+      line += colors.label + (reset || '7d') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
     }
   }
