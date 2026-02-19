@@ -321,7 +321,7 @@ function renderMinimized(state) {
       const label = limitCents != null && limitCents > 0
         ? formatCents(limitCents - usedCents)
         : formatCents(usedCents);
-      line += usageColor + label + ': ' + ansi.reset;
+      line += colors.label + label + ': ' + ansi.reset;
       line += usageColor + pctDisplay + '%' + ansi.reset + ' ';
       line += extraUsageProgressBar(utilization, 10);
     }
