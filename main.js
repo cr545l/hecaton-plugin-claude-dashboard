@@ -51,12 +51,40 @@ const colors = {
   orange: ansi.fg(230, 170, 100),
   border: ansi.fg(100, 55, 45),
   separator: ansi.fg(75, 45, 38),
+  // Extra usage 4-tier color ramp
+  extraCool: ansi.fg(100, 160, 230),     // < 50%
+  extraWarm: ansi.fg(160, 120, 210),     // 50-75%
+  extraHot: ansi.fg(220, 100, 140),      // 75-90%
+  extraCritical: ansi.fg(230, 70, 70),   // >= 90%
 };
 
 function colorForPercent(pct) {
   if (pct <= 50) return colors.green;
   if (pct <= 80) return colors.yellow;
   return colors.red;
+}
+
+function colorForExtraUsage(utilization) {
+  if (utilization < 0.50) return colors.extraCool;
+  if (utilization < 0.75) return colors.extraWarm;
+  if (utilization < 0.90) return colors.extraHot;
+  return colors.extraCritical;
+}
+
+function formatCents(cents) {
+  const absCents = Math.abs(Math.round(cents));
+  const dollars = Math.floor(absCents / 100);
+  const remainder = absCents % 100;
+  const prefix = cents < 0 ? '-' : '';
+  return `${prefix}$${dollars}.${String(remainder).padStart(2, '0')}`;
+}
+
+function extraUsageProgressBar(utilization, width = 20) {
+  const pct = Math.min(utilization, 1.0);
+  const filled = Math.round(pct * width);
+  const empty = width - filled;
+  const color = colorForExtraUsage(utilization);
+  return color + '\u2588'.repeat(filled) + colors.dim + '\u2591'.repeat(empty) + ansi.reset;
 }
 
 // ============================================================
@@ -122,6 +150,7 @@ async function fetchUsageLimits(token) {
       five_hour: data.five_hour ?? null,
       seven_day: data.seven_day ?? null,
       seven_day_sonnet: data.seven_day_sonnet ?? null,
+      extra_usage: data.extra_usage ?? null,
     };
   } catch {
     return null;
@@ -279,6 +308,23 @@ function renderMinimized(state) {
       line += colors.label + (reset || '7d') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
     }
+
+    // Extra usage in minimized mode
+    if (data.extra_usage && data.extra_usage.is_enabled) {
+      const eu = data.extra_usage;
+      const usedCents = eu.used_credits != null ? Math.round(eu.used_credits) : 0;
+      const limitCents = eu.monthly_limit != null ? Math.round(eu.monthly_limit) : null;
+      const utilization = eu.utilization != null ? eu.utilization / 100 : 0;
+      const pctDisplay = Math.round(utilization * 100);
+      const usageColor = colorForExtraUsage(utilization);
+      line += colors.dim + ' | ' + ansi.reset;
+      const label = limitCents != null && limitCents > 0
+        ? formatCents(limitCents - usedCents)
+        : formatCents(usedCents);
+      line += usageColor + label + ': ' + ansi.reset;
+      line += usageColor + pctDisplay + '%' + ansi.reset + ' ';
+      line += extraUsageProgressBar(utilization, 10);
+    }
   }
 
   if (state.lastRefresh) {
@@ -372,6 +418,48 @@ function render(state) {
 
       if (!data.five_hour && !data.seven_day && !data.seven_day_sonnet) {
         lines.push('  ' + colors.dim + 'No rate limit data available' + ansi.reset);
+      }
+
+      // ── Extra Usage ──
+      if (data.extra_usage && data.extra_usage.is_enabled) {
+        lines.push('');
+        lines.push('  ' + colors.title + ansi.bold + 'Extra Usage' + ansi.reset);
+        lines.push('  ' + drawSeparator(width - 3));
+
+        const eu = data.extra_usage;
+        const usedCents = eu.used_credits != null ? Math.round(eu.used_credits) : 0;
+        const limitCents = eu.monthly_limit != null ? Math.round(eu.monthly_limit) : null;
+        // API returns utilization as percentage (e.g. 2.82 = 2.82%), convert to 0-1 fraction
+        const utilization = eu.utilization != null ? eu.utilization / 100 : 0;
+
+        if (usedCents > 0 || (limitCents != null && limitCents > 0)) {
+          const usageColor = colorForExtraUsage(utilization);
+          const pctDisplay = Math.round(utilization * 100);
+
+          // Currency + progress bar on one line: $1.41 / $50.00  ██░░░░░░░░░░░░  3%
+          let currencyText;
+          if (limitCents != null && limitCents > 0) {
+            currencyText = formatCents(usedCents) + ' / ' + formatCents(limitCents);
+          } else {
+            currencyText = formatCents(usedCents) + ' spent';
+          }
+          lines.push(
+            '  ' + usageColor + ansi.bold + currencyText + ansi.reset +
+            '  ' + extraUsageProgressBar(utilization, 15) + '  ' +
+            usageColor + pctDisplay + '%' + ansi.reset
+          );
+
+          // Remaining balance
+          if (limitCents != null && limitCents > 0) {
+            const remainingCents = limitCents - usedCents;
+            lines.push(
+              '  ' + colors.label + 'Remaining: ' + ansi.reset +
+              colors.value + formatCents(remainingCents) + ansi.reset
+            );
+          }
+        } else {
+          lines.push('  ' + colors.dim + 'Extra usage enabled, no spend this period' + ansi.reset);
+        }
       }
     } else {
       lines.push('  ' + colors.yellow + 'Failed to fetch rate limits' + ansi.reset);
