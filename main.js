@@ -37,25 +37,25 @@ const ansi = {
   moveTo: (row, col) => `${CSI}${row};${col}H`,
 };
 
-// Color palette (Claude brand: coral/terracotta)
+// Color palette (ANSI palette for theme compatibility)
 const colors = {
-  bg: ansi.bg(30, 16, 12),
-  title: ansi.fg(215, 105, 70),
-  label: ansi.fg(180, 180, 200),
-  value: ansi.fg(255, 255, 255),
-  dim: ansi.fg(120, 100, 95),
-  green: ansi.fg(120, 220, 150),
-  yellow: ansi.fg(230, 200, 100),
-  red: ansi.fg(230, 110, 110),
-  cyan: ansi.fg(100, 200, 230),
-  orange: ansi.fg(230, 170, 100),
-  border: ansi.fg(100, 55, 45),
-  separator: ansi.fg(75, 45, 38),
+  bg: CSI + '49m',            // default background
+  title: CSI + '91m',         // bright red (coral)
+  label: CSI + '39m',         // default foreground
+  value: CSI + '39m',         // default foreground
+  dim: CSI + '2m',            // SGR dim
+  green: CSI + '32m',         // green
+  yellow: CSI + '33m',        // yellow
+  red: CSI + '31m',           // red
+  cyan: CSI + '36m',          // cyan
+  orange: CSI + '33m',        // yellow
+  border: CSI + '2m',         // SGR dim
+  separator: CSI + '2m',      // SGR dim
   // Extra usage 4-tier color ramp
-  extraCool: ansi.fg(100, 160, 230),     // < 50%
-  extraWarm: ansi.fg(160, 120, 210),     // 50-75%
-  extraHot: ansi.fg(220, 100, 140),      // 75-90%
-  extraCritical: ansi.fg(230, 70, 70),   // >= 90%
+  extraCool: CSI + '36m',     // cyan (< 50%)
+  extraWarm: CSI + '33m',     // yellow (50-75%)
+  extraHot: CSI + '31m',      // red (75-90%)
+  extraCritical: CSI + '91m', // bright red (>= 90%)
 };
 
 function colorForPercent(pct) {
