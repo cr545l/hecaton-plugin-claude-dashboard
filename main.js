@@ -8,8 +8,8 @@
  *
  * Keyboard:
  *   r / R   - Refresh data
+ *   h / H   - Toggle heatmap view
  *   q / ESC - Close (handled by host)
- *   1/2/3   - Switch display mode (compact/normal/detailed)
  */
 
 const fs = require('fs');
@@ -17,6 +17,8 @@ const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
+
+const { version: PLUGIN_VERSION } = require('./plugin.json');
 
 // ============================================================
 // ANSI Helpers
@@ -58,6 +60,16 @@ const colors = {
   extraCritical: CSI + '91m', // bright red (>= 90%)
 };
 
+// Heatmap color palette (orange gradient)
+const heatmapColors = {
+  empty: ansi.fg(68, 68, 68),
+  level1: ansi.fg(196, 160, 0),
+  level2: ansi.fg(218, 140, 0),
+  level3: ansi.fg(240, 100, 0),
+  level4: ansi.fg(255, 60, 0),
+  future: ansi.fg(38, 38, 38),
+};
+
 function colorForPercent(pct) {
   if (pct <= 50) return colors.green;
   if (pct <= 80) return colors.yellow;
@@ -85,6 +97,180 @@ function extraUsageProgressBar(utilization, width = 20) {
   const empty = width - filled;
   const color = colorForExtraUsage(utilization);
   return color + '\u2588'.repeat(filled) + colors.dim + '\u2591'.repeat(empty) + ansi.reset;
+}
+
+// ============================================================
+// Heatmap Data Layer
+// ============================================================
+
+function toLocalDateStr(date) {
+  const d = new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function loadStatsCache() {
+  try {
+    const cachePath = path.join(os.homedir(), '.claude', 'stats-cache.json');
+    const content = await fs.promises.readFile(cachePath, 'utf-8');
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
+async function scanRecentActivity(afterDate) {
+  const activity = new Map();
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  try { await fs.promises.access(projectsDir); } catch { return activity; }
+  const cutoff = afterDate ? new Date(afterDate).getTime() : 0;
+
+  async function scanDir(dir) {
+    try {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await scanDir(fullPath);
+        } else if (entry.name.endsWith('.jsonl')) {
+          try {
+            const stat = await fs.promises.stat(fullPath);
+            if (stat.mtimeMs > cutoff) {
+              const dateStr = toLocalDateStr(stat.mtime);
+              activity.set(dateStr, (activity.get(dateStr) || 0) + 1);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  await scanDir(projectsDir);
+  return activity;
+}
+
+function buildDailyActivityMap(cache, recentScans) {
+  const map = new Map();
+  if (cache && cache.dailyActivity) {
+    for (const entry of cache.dailyActivity) {
+      map.set(entry.date, (map.get(entry.date) || 0) + entry.sessionCount);
+    }
+  }
+  for (const [date, count] of recentScans) {
+    if (!map.has(date)) map.set(date, count);
+  }
+  return map;
+}
+
+function calculateThresholds(activityMap) {
+  const values = [...activityMap.values()].filter(v => v > 0).sort((a, b) => a - b);
+  if (values.length === 0) return [1, 2, 3, 4];
+  const p25 = values[Math.floor(values.length * 0.25)] || 1;
+  const p50 = values[Math.floor(values.length * 0.50)] || 2;
+  const p75 = values[Math.floor(values.length * 0.75)] || 3;
+  const pMax = values[values.length - 1] || 4;
+  return [Math.max(1, p25), Math.max(p25 + 1, p50), Math.max(p50 + 1, p75), Math.max(p75 + 1, pMax)];
+}
+
+function getActivityLevel(count, thresholds) {
+  if (!count || count <= 0) return 0;
+  if (count <= thresholds[0]) return 1;
+  if (count <= thresholds[1]) return 2;
+  if (count <= thresholds[2]) return 3;
+  return 4;
+}
+
+function calculateStreaks(activityMap) {
+  const today = toLocalDateStr(new Date());
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let tempStreak = 0;
+  const dates = [...activityMap.keys()].sort();
+
+  for (let i = 0; i < dates.length; i++) {
+    if (i === 0) { tempStreak = 1; }
+    else {
+      const diffDays = Math.round((new Date(dates[i]) - new Date(dates[i - 1])) / 86400000);
+      tempStreak = diffDays === 1 ? tempStreak + 1 : 1;
+    }
+    longestStreak = Math.max(longestStreak, tempStreak);
+  }
+
+  const d = new Date();
+  if (activityMap.has(today)) {
+    currentStreak = 1;
+    const check = new Date(d);
+    while (true) {
+      check.setDate(check.getDate() - 1);
+      if (activityMap.has(toLocalDateStr(check))) currentStreak++;
+      else break;
+    }
+  } else {
+    const yesterday = new Date(d);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (activityMap.has(toLocalDateStr(yesterday))) {
+      currentStreak = 1;
+      const check = new Date(yesterday);
+      while (true) {
+        check.setDate(check.getDate() - 1);
+        if (activityMap.has(toLocalDateStr(check))) currentStreak++;
+        else break;
+      }
+    }
+  }
+
+  return { currentStreak, longestStreak };
+}
+
+function buildCalendarGrid(activityMap, thresholds) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayStr = toLocalDateStr(today);
+  const todayDow = today.getDay(); // 0=Sun
+  const todayRow = (todayDow + 6) % 7; // 0=Mon, 6=Sun
+
+  const numWeeks = 52;
+  const currentMonday = new Date(today);
+  currentMonday.setDate(currentMonday.getDate() - todayRow);
+  const firstMonday = new Date(currentMonday);
+  firstMonday.setDate(firstMonday.getDate() - (numWeeks - 1) * 7);
+
+  const grid = Array.from({ length: 7 }, () => []);
+  const monthLabels = [];
+  let lastMonth = -1;
+
+  for (let week = 0; week < numWeeks; week++) {
+    for (let row = 0; row < 7; row++) {
+      const d = new Date(firstMonday);
+      d.setDate(d.getDate() + week * 7 + row);
+      const dateStr = toLocalDateStr(d);
+      const isFuture = d > today;
+      const count = activityMap.get(dateStr) || 0;
+      const level = isFuture ? -1 : getActivityLevel(count, thresholds);
+      grid[row][week] = { date: dateStr, level, count, isFuture, isToday: dateStr === todayStr };
+      if (row === 0) {
+        const month = d.getMonth();
+        if (month !== lastMonth) {
+          monthLabels.push({ col: week, label: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][month] });
+          lastMonth = month;
+        }
+      }
+    }
+  }
+
+  return { grid, monthLabels, numWeeks };
+}
+
+async function loadHeatmapData() {
+  const cache = await loadStatsCache();
+  const afterDate = cache?.lastComputedDate || null;
+  const recentScans = await scanRecentActivity(afterDate);
+  const activityMap = buildDailyActivityMap(cache, recentScans);
+  const thresholds = calculateThresholds(activityMap);
+  const streaks = calculateStreaks(activityMap);
+  const { grid, monthLabels, numWeeks } = buildCalendarGrid(activityMap, thresholds);
+  const totalDays = [...activityMap.keys()].length;
+  const totalSessions = [...activityMap.values()].reduce((a, b) => a + b, 0);
+  return { grid, monthLabels, numWeeks, thresholds, streaks, totalDays, totalSessions };
 }
 
 // ============================================================
@@ -353,7 +539,7 @@ function render(state) {
   lines.push('');
   lines.push(centerText(
     colors.title + ansi.bold + ' Claude Dashboard ' + ansi.reset +
-    colors.dim + 'v1.0.2' + ansi.reset,
+    colors.dim + 'v' + PLUGIN_VERSION + ansi.reset,
     width
   ));
   lines.push('');
@@ -361,7 +547,7 @@ function render(state) {
   if (state.error) {
     lines.push(centerText(colors.red + state.error + ansi.reset, width));
     lines.push('');
-    currentButtons = [{ label: '[r] Refresh', action: 'refresh' }];
+    currentButtons = [{ label: '[r] Refresh', action: 'refresh' }, { label: '[h] Heatmap', action: 'heatmap_toggle' }];
     buttonLineIdx = lines.length;
     lines.push(centerText(buildHintText(currentButtons), width));
   } else if (state.loading) {
@@ -369,12 +555,14 @@ function render(state) {
   } else {
     const data = state.data;
 
-    // ── Model & Effort ──
+    // ── Plan & Effort ──
     const effortMap = { high: 'H', medium: 'M', low: 'L' };
     const effortLabel = effortMap[state.effort] || 'H';
+    const planLabel = state.config.plan === 'max' ? 'Max' : 'Pro';
     lines.push(
-      '  ' + colors.label + 'Model: ' + ansi.reset +
-      colors.value + ansi.bold + (state.effort !== 'high' ? `[${effortLabel}] ` : '') + 'Claude' + ansi.reset
+      '  ' + colors.label + 'Plan: ' + ansi.reset +
+      colors.value + ansi.bold + planLabel + ansi.reset +
+      (state.effort !== 'high' ? colors.dim + '  Effort: ' + ansi.reset + colors.value + effortLabel + ansi.reset : '')
     );
     lines.push('');
 
@@ -473,31 +661,15 @@ function render(state) {
     lines.push('  ' + drawSeparator(width - 3));
 
     const elapsed = Date.now() - state.startTime;
-    lines.push(
-      '  ' + colors.label + 'Uptime: ' + ansi.reset +
-      colors.value + formatDuration(elapsed) + ansi.reset +
-      colors.dim + '  |  ' + ansi.reset +
-      colors.label + 'Refreshes: ' + ansi.reset +
-      colors.value + state.refreshCount + ansi.reset
-    );
-
+    let sessionLine = '  ' + colors.label + 'Uptime: ' + ansi.reset +
+      colors.value + formatDuration(elapsed) + ansi.reset;
     if (state.lastRefresh) {
       const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
-      lines.push(
-        '  ' + colors.label + 'Last update: ' + ansi.reset +
-        colors.dim + ago + 's ago' + ansi.reset
-      );
+      sessionLine += colors.dim + '  |  ' + ansi.reset +
+        colors.label + 'Updated: ' + ansi.reset +
+        colors.dim + ago + 's ago' + ansi.reset;
     }
-
-    lines.push('');
-
-    // ── Plan Info ──
-    lines.push('  ' + colors.title + ansi.bold + 'Account' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 3));
-    lines.push(
-      '  ' + colors.label + 'Plan: ' + ansi.reset +
-      colors.value + (state.config.plan === 'max' ? 'Max' : 'Pro') + ansi.reset
-    );
+    lines.push(sessionLine);
 
     lines.push('');
 
@@ -505,9 +677,7 @@ function render(state) {
     lines.push('  ' + drawSeparator(width - 3));
     currentButtons = [
       { label: '[r] Refresh', action: 'refresh' },
-      { label: '[1] Compact', action: 'mode1' },
-      { label: '[2] Normal', action: 'mode2' },
-      { label: '[3] Detailed', action: 'mode3' },
+      { label: '[h] Heatmap', action: 'heatmap_toggle' },
     ];
     buttonLineIdx = lines.length;
     lines.push('  ' + buildHintText(currentButtons));
@@ -530,6 +700,134 @@ function render(state) {
   if (buttonLineIdx >= 0 && currentButtons.length > 0) {
     const screenRow = startRow + buttonLineIdx + 1; // +1 for box top border
     const contentStart = startCol + 2; // after │ and space in box
+    const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
+    for (const btn of currentButtons) {
+      const idx = plainLine.indexOf(btn.label);
+      if (idx >= 0) {
+        clickableAreas.push({
+          row: screenRow,
+          colStart: contentStart + idx,
+          colEnd: contentStart + idx + btn.label.length - 1,
+          action: btn.action,
+        });
+      }
+    }
+  }
+  if (hoveredAreaIndex >= clickableAreas.length) hoveredAreaIndex = -1;
+}
+
+function renderHeatmap(state) {
+  const { cols, rows } = getTermSize();
+  const width = Math.min(cols, 72);
+  const lines = [];
+  let buttonLineIdx = -1;
+  currentButtons = [];
+
+  lines.push('');
+  lines.push(centerText(
+    colors.title + ansi.bold + ' Activity Heatmap ' + ansi.reset +
+    colors.dim + '(52 weeks)' + ansi.reset,
+    width
+  ));
+  lines.push('');
+
+  if (state.heatmapLoading) {
+    lines.push(centerText(colors.dim + 'Loading heatmap data...' + ansi.reset, width));
+  } else if (!state.heatmapData) {
+    lines.push(centerText(colors.dim + 'No activity data available' + ansi.reset, width));
+  } else {
+    const hd = state.heatmapData;
+    const labelWidth = 4;
+    const dayLabels = ['Mon', '', 'Wed', '', 'Fri', '', 'Sun'];
+
+    // Month labels
+    const monthChars = new Array(hd.numWeeks).fill(' ');
+    let lastEnd = -1;
+    for (const { col, label } of hd.monthLabels) {
+      if (col > lastEnd) {
+        for (let i = 0; i < label.length && col + i < hd.numWeeks; i++) {
+          monthChars[col + i] = label[i];
+        }
+        lastEnd = col + label.length;
+      }
+    }
+    lines.push('  ' + ' '.repeat(labelWidth) + colors.dim + monthChars.join('') + ansi.reset);
+
+    // Grid rows (Mon=0 to Sun=6)
+    for (let dow = 0; dow < 7; dow++) {
+      let line = '  ' + colors.dim + (dayLabels[dow] || ' ').padEnd(labelWidth) + ansi.reset;
+      for (let week = 0; week < hd.numWeeks; week++) {
+        const cell = hd.grid[dow] && hd.grid[dow][week];
+        if (!cell) { line += ' '; continue; }
+        let color;
+        if (cell.isFuture) color = heatmapColors.future;
+        else switch (cell.level) {
+          case 1: color = heatmapColors.level1; break;
+          case 2: color = heatmapColors.level2; break;
+          case 3: color = heatmapColors.level3; break;
+          case 4: color = heatmapColors.level4; break;
+          default: color = heatmapColors.empty;
+        }
+        line += color + '\u2588' + ansi.reset;
+      }
+      lines.push(line);
+    }
+
+    lines.push('');
+
+    // Legend
+    let legend = '  ' + colors.dim + 'Less ' + ansi.reset;
+    legend += heatmapColors.empty + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level1 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level2 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level3 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level4 + '\u2588' + ansi.reset;
+    legend += colors.dim + ' More' + ansi.reset;
+    lines.push(legend);
+
+    lines.push('');
+
+    // Statistics
+    lines.push('  ' + colors.title + ansi.bold + 'Statistics' + ansi.reset);
+    lines.push('  ' + drawSeparator(width - 3));
+    lines.push(
+      '  ' + colors.label + 'Active days: ' + ansi.reset +
+      colors.value + ansi.bold + hd.totalDays + ansi.reset +
+      colors.dim + '  |  ' + ansi.reset +
+      colors.label + 'Sessions: ' + ansi.reset +
+      colors.value + ansi.bold + hd.totalSessions + ansi.reset
+    );
+    lines.push(
+      '  ' + colors.label + 'Current streak: ' + ansi.reset +
+      colors.value + ansi.bold + hd.streaks.currentStreak + ' days' + ansi.reset +
+      colors.dim + '  |  ' + ansi.reset +
+      colors.label + 'Longest: ' + ansi.reset +
+      colors.value + ansi.bold + hd.streaks.longestStreak + ' days' + ansi.reset
+    );
+  }
+
+  lines.push('');
+  lines.push('  ' + drawSeparator(width - 3));
+  currentButtons = [
+    { label: '[r] Refresh', action: 'heatmap_refresh' },
+    { label: '[h] Dashboard', action: 'heatmap_toggle' },
+  ];
+  buttonLineIdx = lines.length;
+  lines.push('  ' + buildHintText(currentButtons));
+  lines.push('');
+
+  const boxed = drawBox(lines, width);
+  process.stdout.write(ansi.clear + ansi.hideCursor);
+  const startRow = Math.max(1, Math.floor((rows - boxed.length) / 2));
+  const startCol = Math.max(1, Math.floor((cols - width) / 2));
+  for (let i = 0; i < boxed.length; i++) {
+    process.stdout.write(ansi.moveTo(startRow + i, startCol) + colors.bg + boxed[i] + ansi.reset);
+  }
+
+  clickableAreas = [];
+  if (buttonLineIdx >= 0 && currentButtons.length > 0) {
+    const screenRow = startRow + buttonLineIdx + 1;
+    const contentStart = startCol + 2;
     const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
     for (const btn of currentButtons) {
       const idx = plainLine.indexOf(btn.label);
@@ -570,6 +868,9 @@ async function main() {
     lastRefresh: null,
     refreshCount: 0,
     minimized: false,
+    heatmapView: false,
+    heatmapData: null,
+    heatmapLoading: false,
   };
 
   // Initial render
@@ -582,6 +883,7 @@ async function main() {
   // Fetch data
   function rerender() {
     if (state.minimized) renderMinimized(state);
+    else if (state.heatmapView) renderHeatmap(state);
     else render(state);
   }
 
@@ -609,6 +911,18 @@ async function main() {
       state.loading = false;
       rerender();
     }
+  }
+
+  async function refreshHeatmap() {
+    state.heatmapLoading = true;
+    rerender();
+    try {
+      state.heatmapData = await loadHeatmapData();
+    } catch {
+      state.heatmapData = null;
+    }
+    state.heatmapLoading = false;
+    rerender();
   }
 
   await refresh();
@@ -642,8 +956,7 @@ async function main() {
           if (json.method === 'resize' && json.params) {
             termCols = json.params.cols || termCols;
             termRows = json.params.rows || termRows;
-            if (state.minimized) renderMinimized(state);
-            else render(state);
+            rerender();
           }
           if (json.method === 'minimize') {
             state.minimized = true;
@@ -651,7 +964,7 @@ async function main() {
           }
           if (json.method === 'restore') {
             state.minimized = false;
-            render(state);
+            rerender();
           }
         } catch { /* ignore malformed segment */ }
       }
@@ -681,7 +994,7 @@ async function main() {
         }
         if (newHover !== hoveredAreaIndex) {
           hoveredAreaIndex = newHover;
-          render(state);
+          rerender();
         }
         continue;
       }
@@ -698,9 +1011,14 @@ async function main() {
           if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
             switch (area.action) {
               case 'refresh': await refresh(); break;
-              case 'mode1': state.config.displayMode = 'compact'; render(state); break;
-              case 'mode2': state.config.displayMode = 'normal'; render(state); break;
-              case 'mode3': state.config.displayMode = 'detailed'; render(state); break;
+              case 'heatmap_toggle':
+                if (!state.minimized) {
+                  state.heatmapView = !state.heatmapView;
+                  if (state.heatmapView && !state.heatmapData) await refreshHeatmap();
+                  else rerender();
+                }
+                break;
+              case 'heatmap_refresh': await refreshHeatmap(); break;
             }
             break;
           }
@@ -712,24 +1030,20 @@ async function main() {
     switch (key) {
       case 'r':
       case 'R':
-        await refresh();
+        if (state.heatmapView) await refreshHeatmap();
+        else await refresh();
+        break;
+      case 'h':
+      case 'H':
+        if (state.minimized) break;
+        state.heatmapView = !state.heatmapView;
+        if (state.heatmapView && !state.heatmapData) await refreshHeatmap();
+        else rerender();
         break;
       case 'q':
       case 'Q':
         cleanup();
         sendRpc('close');
-        break;
-      case '1':
-        state.config.displayMode = 'compact';
-        render(state);
-        break;
-      case '2':
-        state.config.displayMode = 'normal';
-        render(state);
-        break;
-      case '3':
-        state.config.displayMode = 'detailed';
-        render(state);
         break;
     }
   });
