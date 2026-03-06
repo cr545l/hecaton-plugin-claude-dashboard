@@ -314,6 +314,28 @@ async function getCredentialsFromFile() {
   }
 }
 
+let autoRefreshMs = 300000; // 5 minutes default
+
+const PLUGIN_DIR_NAME = path.basename(path.resolve(__dirname));
+const CACHE_DIR = path.join(os.homedir(), '.hecaton', 'data', PLUGIN_DIR_NAME);
+const CACHE_FILE = path.join(CACHE_DIR, 'cache.json');
+
+async function loadCache() {
+  try {
+    const content = await fs.promises.readFile(CACHE_FILE, 'utf-8');
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
+async function saveCache(data) {
+  try {
+    await fs.promises.mkdir(CACHE_DIR, { recursive: true });
+    await fs.promises.writeFile(CACHE_FILE, JSON.stringify({ ...data, _cachedAt: Date.now() }), 'utf-8');
+  } catch { /* ignore write errors */ }
+}
+
 async function fetchUsageLimits(token) {
   try {
     const controller = new AbortController();
@@ -330,7 +352,19 @@ async function fetchUsageLimits(token) {
       signal: controller.signal,
     });
     clearTimeout(timeout);
-    if (!response.ok) return null;
+    if (!response.ok) {
+      if (response.status === 429) {
+        // Back off: double the interval (max 30 min)
+        autoRefreshMs = Math.min(autoRefreshMs * 2, 1800000);
+        return { _error: 'API rate limited (429). Retrying in ' + Math.round(autoRefreshMs / 60000) + 'min...' };
+      }
+      if (response.status === 401) {
+        return { _error: 'Token expired or invalid (401). Re-login to Claude Code.' };
+      }
+      return { _error: `API error (HTTP ${response.status})` };
+    }
+    // Successful response: reset interval to default
+    autoRefreshMs = 300000;
     const data = await response.json();
     return {
       five_hour: data.five_hour ?? null,
@@ -338,8 +372,9 @@ async function fetchUsageLimits(token) {
       seven_day_sonnet: data.seven_day_sonnet ?? null,
       extra_usage: data.extra_usage ?? null,
     };
-  } catch {
-    return null;
+  } catch (e) {
+    if (e.name === 'AbortError') return { _error: 'Request timed out' };
+    return { _error: 'Network error: ' + (e.message || 'unknown') };
   }
 }
 
@@ -515,8 +550,9 @@ function renderMinimized(state) {
 
   if (state.lastRefresh) {
     const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
+    const cacheTag = (state.data && state.data._fromCache) ? ' (cached)' : '';
     line += colors.dim + ' | ' + ansi.reset;
-    line += colors.dim + '\u21bb ' + ago + 's' + ansi.reset;
+    line += colors.dim + '\u21bb ' + ago + 's' + cacheTag + ansi.reset;
   }
 
   // Pad/truncate to terminal width
@@ -570,7 +606,7 @@ function render(state) {
     lines.push('  ' + colors.title + ansi.bold + 'Rate Limits' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
 
-    if (data) {
+    if (data && !data._error) {
       // 5-hour
       if (data.five_hour) {
         const pct = Math.round(data.five_hour.utilization);
@@ -649,6 +685,8 @@ function render(state) {
           lines.push('  ' + colors.dim + 'Extra usage enabled, no spend this period' + ansi.reset);
         }
       }
+    } else if (data && data._error) {
+      lines.push('  ' + colors.yellow + data._error + ansi.reset);
     } else {
       lines.push('  ' + colors.yellow + 'Failed to fetch rate limits' + ansi.reset);
       lines.push('  ' + colors.dim + 'Check ~/.claude/.credentials.json' + ansi.reset);
@@ -665,9 +703,10 @@ function render(state) {
       colors.value + formatDuration(elapsed) + ansi.reset;
     if (state.lastRefresh) {
       const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
+      const cacheTag = (state.data && state.data._fromCache) ? ' (cached)' : '';
       sessionLine += colors.dim + '  |  ' + ansi.reset +
         colors.label + 'Updated: ' + ansi.reset +
-        colors.dim + ago + 's ago' + ansi.reset;
+        colors.dim + ago + 's ago' + cacheTag + ansi.reset;
     }
     lines.push(sessionLine);
 
@@ -901,13 +940,34 @@ async function main() {
         return;
       }
       const data = await fetchUsageLimits(token);
-      state.data = data;
+      if (data && !data._error) {
+        state.data = data;
+        state.lastRefresh = Date.now();
+        state.refreshCount++;
+        await saveCache(data);
+      } else {
+        // API error — fall back to cached data
+        const cached = await loadCache();
+        if (cached) {
+          state.data = cached;
+          state.data._fromCache = true;
+          state.lastRefresh = cached._cachedAt || null;
+        } else {
+          state.data = data; // show error message
+        }
+      }
       state.loading = false;
-      state.lastRefresh = Date.now();
-      state.refreshCount++;
       rerender();
     } catch (e) {
-      state.error = 'Failed to fetch: ' + (e.message || 'unknown error');
+      // Network error — fall back to cached data
+      const cached = await loadCache();
+      if (cached) {
+        state.data = cached;
+        state.data._fromCache = true;
+        state.lastRefresh = cached._cachedAt || null;
+      } else {
+        state.error = 'Failed to fetch: ' + (e.message || 'unknown error');
+      }
       state.loading = false;
       rerender();
     }
@@ -927,10 +987,16 @@ async function main() {
 
   await refresh();
 
-  // Auto-refresh every 60 seconds
-  const autoRefreshInterval = setInterval(() => {
-    refresh().catch(() => {});
-  }, 60000);
+  // Auto-refresh with dynamic interval (backs off on 429)
+  let autoRefreshTimer = null;
+  function scheduleAutoRefresh() {
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(async () => {
+      await refresh().catch(() => {});
+      scheduleAutoRefresh();
+    }, autoRefreshMs);
+  }
+  scheduleAutoRefresh();
 
   // Handle stdin for keyboard input
   // In Hecaton plugin mode, stdin is a pipe (not TTY), so rawMode is not needed.
@@ -1049,7 +1115,7 @@ async function main() {
   });
 
   function cleanup() {
-    clearInterval(autoRefreshInterval);
+    clearTimeout(autoRefreshTimer);
     process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
   }
 
