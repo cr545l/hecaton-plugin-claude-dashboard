@@ -12,13 +12,17 @@
  *   q / ESC - Close (handled by host)
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { execFileSync } = require('child_process');
-const crypto = require('crypto');
+// ============================================================
+// Hecaton Host API helpers & path utilities
+// ============================================================
 
-const { version: PLUGIN_VERSION } = require('./plugin.json');
+function joinPath(...parts) {
+  return parts.join('/').replace(/\\/g, '/').replace(/\/+/g, '/');
+}
+
+// Read plugin.json inline (synchronous hecaton call)
+const _pluginJsonResult = hecaton.fs_read_file({ path: joinPath(__dirname, 'plugin.json') });
+const PLUGIN_VERSION = _pluginJsonResult.ok ? JSON.parse(_pluginJsonResult.text).version : '0.0.0';
 
 // ============================================================
 // ANSI Helpers
@@ -108,34 +112,39 @@ function toLocalDateStr(date) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-async function loadStatsCache() {
+function loadStatsCache() {
   try {
-    const cachePath = path.join(os.homedir(), '.claude', 'stats-cache.json');
-    const content = await fs.promises.readFile(cachePath, 'utf-8');
-    return JSON.parse(content);
+    const home = hecaton.get_home_dir().home;
+    const cachePath = joinPath(home, '.claude', 'stats-cache.json');
+    const result = hecaton.fs_read_file({ path: cachePath });
+    if (!result.ok) return null;
+    return JSON.parse(result.text);
   } catch {
     return null;
   }
 }
 
-async function scanRecentActivity(afterDate) {
+function scanRecentActivity(afterDate) {
   const activity = new Map();
-  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
-  try { await fs.promises.access(projectsDir); } catch { return activity; }
+  const home = hecaton.get_home_dir().home;
+  const projectsDir = joinPath(home, '.claude', 'projects');
+  const statResult = hecaton.fs_stat({ path: projectsDir });
+  if (!statResult.ok || !statResult.exists) return activity;
   const cutoff = afterDate ? new Date(afterDate).getTime() : 0;
 
-  async function scanDir(dir) {
+  function scanDir(dir) {
     try {
-      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          await scanDir(fullPath);
+      const dirResult = hecaton.fs_read_dir({ path: dir });
+      if (!dirResult.ok) return;
+      for (const entry of dirResult.entries) {
+        const fullPath = joinPath(dir, entry.name);
+        if (entry.isDirectory) {
+          scanDir(fullPath);
         } else if (entry.name.endsWith('.jsonl')) {
           try {
-            const stat = await fs.promises.stat(fullPath);
-            if (stat.mtimeMs > cutoff) {
-              const dateStr = toLocalDateStr(stat.mtime);
+            const st = hecaton.fs_stat({ path: fullPath });
+            if (st.ok && st.mtimeMs > cutoff) {
+              const dateStr = toLocalDateStr(new Date(st.mtimeMs));
               activity.set(dateStr, (activity.get(dateStr) || 0) + 1);
             }
           } catch { /* skip */ }
@@ -144,7 +153,7 @@ async function scanRecentActivity(afterDate) {
     } catch { /* skip */ }
   }
 
-  await scanDir(projectsDir);
+  scanDir(projectsDir);
   return activity;
 }
 
@@ -260,10 +269,10 @@ function buildCalendarGrid(activityMap, thresholds) {
   return { grid, monthLabels, numWeeks };
 }
 
-async function loadHeatmapData() {
-  const cache = await loadStatsCache();
+function loadHeatmapData() {
+  const cache = loadStatsCache();
   const afterDate = cache?.lastComputedDate || null;
-  const recentScans = await scanRecentActivity(afterDate);
+  const recentScans = scanRecentActivity(afterDate);
   const activityMap = buildDailyActivityMap(cache, recentScans);
   const thresholds = calculateThresholds(activityMap);
   const streaks = calculateStreaks(activityMap);
@@ -278,12 +287,13 @@ async function loadHeatmapData() {
 // ============================================================
 let credentialsCache = null;
 
-async function getCredentials() {
+function getCredentials() {
   try {
-    if (process.platform === 'darwin') {
+    const platform = hecaton.get_platform();
+    if (platform.os === 'macos') {
       return getCredentialsFromKeychain();
     }
-    return await getCredentialsFromFile();
+    return getCredentialsFromFile();
   } catch {
     return null;
   }
@@ -291,48 +301,64 @@ async function getCredentials() {
 
 function getCredentialsFromKeychain() {
   try {
-    const result = execFileSync(
-      'security',
-      ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    const creds = JSON.parse(result);
+    const result = hecaton.exec_process({
+      program: 'security',
+      args: ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+      timeout: 5000,
+    });
+    if (!result.ok) return getCredentialsFromFile();
+    const creds = JSON.parse(result.stdout.trim());
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch {
     return getCredentialsFromFile();
   }
 }
 
-async function getCredentialsFromFile() {
+function getCredentialsFromFile() {
   try {
-    const credPath = path.join(os.homedir(), '.claude', '.credentials.json');
-    const content = await fs.promises.readFile(credPath, 'utf-8');
-    const creds = JSON.parse(content);
+    const homeResult = hecaton.get_home_dir();
+    const home = homeResult ? homeResult.home : null;
+    if (!home) {
+      process.stderr.write('[claude-dashboard] get_home_dir failed: ' + JSON.stringify(homeResult) + '\n');
+      return null;
+    }
+    const credPath = joinPath(home, '.claude', '.credentials.json');
+    process.stderr.write('[claude-dashboard] Reading credentials from: ' + credPath + '\n');
+    const result = hecaton.fs_read_file({ path: credPath });
+    process.stderr.write('[claude-dashboard] fs_read_file result: ok=' + result.ok + ' error=' + (result.error || 'none') + '\n');
+    if (!result.ok) return null;
+    const creds = JSON.parse(result.text);
     return creds?.claudeAiOauth?.accessToken ?? null;
-  } catch {
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] getCredentialsFromFile error: ' + (e.message || e) + '\n');
     return null;
   }
 }
 
 let autoRefreshMs = 300000; // 5 minutes default
 
-const PLUGIN_DIR_NAME = path.basename(path.resolve(__dirname));
-const CACHE_DIR = path.join(os.homedir(), '.hecaton', 'data', PLUGIN_DIR_NAME);
-const CACHE_FILE = path.join(CACHE_DIR, 'cache.json');
+const PLUGIN_DIR_NAME = (function() {
+  // Extract directory name from __dirname
+  const parts = __dirname.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || 'hecaton-plugin-claude-dashboard';
+})();
+const CACHE_DIR = joinPath(hecaton.get_home_dir().home, '.hecaton', 'data', PLUGIN_DIR_NAME);
+const CACHE_FILE = joinPath(CACHE_DIR, 'cache.json');
 
-async function loadCache() {
+function loadCache() {
   try {
-    const content = await fs.promises.readFile(CACHE_FILE, 'utf-8');
-    return JSON.parse(content);
+    const result = hecaton.fs_read_file({ path: CACHE_FILE });
+    if (!result.ok) return null;
+    return JSON.parse(result.text);
   } catch {
     return null;
   }
 }
 
-async function saveCache(data) {
+function saveCache(data) {
   try {
-    await fs.promises.mkdir(CACHE_DIR, { recursive: true });
-    await fs.promises.writeFile(CACHE_FILE, JSON.stringify({ ...data, _cachedAt: Date.now() }), 'utf-8');
+    hecaton.fs_mkdir({ path: CACHE_DIR, recursive: true });
+    hecaton.fs_write_file({ path: CACHE_FILE, text: JSON.stringify({ ...data, _cachedAt: Date.now() }) });
   } catch { /* ignore write errors */ }
 }
 
@@ -382,21 +408,25 @@ async function fetchUsageLimits(token) {
 // Config & Settings
 // ============================================================
 
-async function loadConfig() {
+function loadConfig() {
   try {
-    const configPath = path.join(os.homedir(), '.claude', 'claude-dashboard.local.json');
-    const content = await fs.promises.readFile(configPath, 'utf-8');
-    return { plan: 'max', displayMode: 'detailed', ...JSON.parse(content) };
+    const home = hecaton.get_home_dir().home;
+    const configPath = joinPath(home, '.claude', 'claude-dashboard.local.json');
+    const result = hecaton.fs_read_file({ path: configPath });
+    if (!result.ok) return { plan: 'max', displayMode: 'detailed', language: 'auto' };
+    return { plan: 'max', displayMode: 'detailed', ...JSON.parse(result.text) };
   } catch {
     return { plan: 'max', displayMode: 'detailed', language: 'auto' };
   }
 }
 
-async function getEffortLevel() {
+function getEffortLevel() {
   try {
-    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-    const content = await fs.promises.readFile(settingsPath, 'utf-8');
-    const settings = JSON.parse(content);
+    const home = hecaton.get_home_dir().home;
+    const settingsPath = joinPath(home, '.claude', 'settings.json');
+    const result = hecaton.fs_read_file({ path: settingsPath });
+    if (!result.ok) return 'high';
+    const settings = JSON.parse(result.text);
     return settings?.effortLevel ?? 'high';
   } catch {
     return 'high';
@@ -453,8 +483,8 @@ function formatResetTime(resetAt) {
 // ============================================================
 
 // Dynamic terminal size (updated by host resize notifications)
-let termCols = parseInt(process.env.HECA_COLS || '80', 10);
-let termRows = parseInt(process.env.HECA_ROWS || '24', 10);
+let termCols = parseInt((hecaton.get_env({ name: 'HECA_COLS' }) || {}).value || '80', 10);
+let termRows = parseInt((hecaton.get_env({ name: 'HECA_ROWS' }) || {}).value || '24', 10);
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
@@ -591,7 +621,7 @@ function render(state) {
   } else {
     const data = state.data;
 
-    // ── Plan & Effort ──
+    // -- Plan & Effort --
     const effortMap = { high: 'H', medium: 'M', low: 'L' };
     const effortLabel = effortMap[state.effort] || 'H';
     const planLabel = state.config.plan === 'max' ? 'Max' : 'Pro';
@@ -602,7 +632,7 @@ function render(state) {
     );
     lines.push('');
 
-    // ── Rate Limits ──
+    // -- Rate Limits --
     lines.push('  ' + colors.title + ansi.bold + 'Rate Limits' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
 
@@ -644,7 +674,7 @@ function render(state) {
         lines.push('  ' + colors.dim + 'No rate limit data available' + ansi.reset);
       }
 
-      // ── Extra Usage ──
+      // -- Extra Usage --
       if (data.extra_usage && data.extra_usage.is_enabled) {
         lines.push('');
         lines.push('  ' + colors.title + ansi.bold + 'Extra Usage' + ansi.reset);
@@ -694,7 +724,7 @@ function render(state) {
 
     lines.push('');
 
-    // ── Session Info ──
+    // -- Session Info --
     lines.push('  ' + colors.title + ansi.bold + 'Session' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
 
@@ -712,7 +742,7 @@ function render(state) {
 
     lines.push('');
 
-    // ── Keyboard ──
+    // -- Keyboard --
     lines.push('  ' + drawSeparator(width - 3));
     currentButtons = [
       { label: '[r] Refresh', action: 'refresh' },
@@ -738,7 +768,7 @@ function render(state) {
   clickableAreas = [];
   if (buttonLineIdx >= 0 && currentButtons.length > 0) {
     const screenRow = startRow + buttonLineIdx + 1; // +1 for box top border
-    const contentStart = startCol + 2; // after │ and space in box
+    const contentStart = startCol + 2; // after | and space in box
     const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
     for (const btn of currentButtons) {
       const idx = plainLine.indexOf(btn.label);
@@ -915,9 +945,9 @@ async function main() {
   // Initial render
   render(state);
 
-  // Load config
-  state.config = await loadConfig();
-  state.effort = await getEffortLevel();
+  // Load config (now synchronous)
+  state.config = loadConfig();
+  state.effort = getEffortLevel();
 
   // Fetch data
   function rerender() {
@@ -932,7 +962,7 @@ async function main() {
     rerender();
 
     try {
-      const token = await getCredentials();
+      const token = getCredentials();
       if (!token) {
         state.error = 'No credentials found';
         state.loading = false;
@@ -944,10 +974,10 @@ async function main() {
         state.data = data;
         state.lastRefresh = Date.now();
         state.refreshCount++;
-        await saveCache(data);
+        saveCache(data);
       } else {
-        // API error — fall back to cached data
-        const cached = await loadCache();
+        // API error -- fall back to cached data
+        const cached = loadCache();
         if (cached) {
           state.data = cached;
           state.data._fromCache = true;
@@ -959,8 +989,8 @@ async function main() {
       state.loading = false;
       rerender();
     } catch (e) {
-      // Network error — fall back to cached data
-      const cached = await loadCache();
+      // Network error -- fall back to cached data
+      const cached = loadCache();
       if (cached) {
         state.data = cached;
         state.data._fromCache = true;
@@ -973,11 +1003,11 @@ async function main() {
     }
   }
 
-  async function refreshHeatmap() {
+  function refreshHeatmap() {
     state.heatmapLoading = true;
     rerender();
     try {
-      state.heatmapData = await loadHeatmapData();
+      state.heatmapData = loadHeatmapData();
     } catch {
       state.heatmapData = null;
     }
@@ -985,19 +1015,7 @@ async function main() {
     rerender();
   }
 
-  await refresh();
-
-  // Auto-refresh with dynamic interval (backs off on 429)
-  let autoRefreshTimer = null;
-  function scheduleAutoRefresh() {
-    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
-    autoRefreshTimer = setTimeout(async () => {
-      await refresh().catch(() => {});
-      scheduleAutoRefresh();
-    }, autoRefreshMs);
-  }
-  scheduleAutoRefresh();
-
+  // Setup stdin BEFORE any await to keep the deno event loop alive.
   // Handle stdin for keyboard input
   // In Hecaton plugin mode, stdin is a pipe (not TTY), so rawMode is not needed.
   // The host forwards keystrokes as VT sequences directly.
@@ -1067,11 +1085,11 @@ async function main() {
 
       if (isRelease) continue;
 
-      // Scroll wheel up → refresh
+      // Scroll wheel up -> refresh
       if (cb === 64) { await refresh(); continue; }
-      if (cb === 65) continue; // scroll down → ignore
+      if (cb === 65) continue; // scroll down -> ignore
 
-      // Left click → check clickable areas
+      // Left click -> check clickable areas
       if (cb === 0) {
         for (const area of clickableAreas) {
           if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
@@ -1080,11 +1098,11 @@ async function main() {
               case 'heatmap_toggle':
                 if (!state.minimized) {
                   state.heatmapView = !state.heatmapView;
-                  if (state.heatmapView && !state.heatmapData) await refreshHeatmap();
+                  if (state.heatmapView && !state.heatmapData) refreshHeatmap();
                   else rerender();
                 }
                 break;
-              case 'heatmap_refresh': await refreshHeatmap(); break;
+              case 'heatmap_refresh': refreshHeatmap(); break;
             }
             break;
           }
@@ -1096,14 +1114,14 @@ async function main() {
     switch (key) {
       case 'r':
       case 'R':
-        if (state.heatmapView) await refreshHeatmap();
+        if (state.heatmapView) refreshHeatmap();
         else await refresh();
         break;
       case 'h':
       case 'H':
         if (state.minimized) break;
         state.heatmapView = !state.heatmapView;
-        if (state.heatmapView && !state.heatmapData) await refreshHeatmap();
+        if (state.heatmapView && !state.heatmapData) refreshHeatmap();
         else rerender();
         break;
       case 'q':
@@ -1114,6 +1132,16 @@ async function main() {
     }
   });
 
+  // Auto-refresh with dynamic interval (backs off on 429)
+  let autoRefreshTimer = null;
+  function scheduleAutoRefresh() {
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(async () => {
+      await refresh().catch(() => {});
+      scheduleAutoRefresh();
+    }, autoRefreshMs);
+  }
+
   function cleanup() {
     clearTimeout(autoRefreshTimer);
     process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
@@ -1123,6 +1151,10 @@ async function main() {
   process.on('SIGTERM', () => { cleanup(); process.exit(0); });
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.stdin.on('end', () => { cleanup(); process.exit(0); });
+
+  // Start initial refresh and auto-refresh (AFTER stdin is registered)
+  await refresh();
+  scheduleAutoRefresh();
 }
 
 main().catch((e) => {
