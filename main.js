@@ -362,12 +362,10 @@ function saveCache(data) {
   } catch { /* ignore write errors */ }
 }
 
-async function fetchUsageLimits(token) {
+function fetchUsageLimits(token) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
-      method: 'GET',
+    const resp = hecaton.http_get({
+      url: 'https://api.anthropic.com/api/oauth/usage',
       headers: {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
@@ -375,23 +373,27 @@ async function fetchUsageLimits(token) {
         'Authorization': `Bearer ${token}`,
         'anthropic-beta': 'oauth-2025-04-20',
       },
-      signal: controller.signal,
+      timeoutSec: 5,
     });
-    clearTimeout(timeout);
-    if (!response.ok) {
-      if (response.status === 429) {
-        // Back off: double the interval (max 30 min)
-        autoRefreshMs = Math.min(autoRefreshMs * 2, 1800000);
-        return { _error: 'API rate limited (429). Retrying in ' + Math.round(autoRefreshMs / 60000) + 'min...' };
-      }
-      if (response.status === 401) {
-        return { _error: 'Token expired or invalid (401). Re-login to Claude Code.' };
-      }
-      return { _error: `API error (HTTP ${response.status})` };
+
+    if (!resp.ok) {
+      return { _error: 'Network error: ' + (resp.error || 'Request failed') };
     }
+
+    if (resp.status === 429) {
+      autoRefreshMs = Math.min(autoRefreshMs * 2, 1800000);
+      return { _error: 'API rate limited (429). Retrying in ' + Math.round(autoRefreshMs / 60000) + 'min...' };
+    }
+    if (resp.status === 401) {
+      return { _error: 'Token expired or invalid (401). Re-login to Claude Code.' };
+    }
+    if (resp.status !== 200) {
+      return { _error: `API error (HTTP ${resp.status})` };
+    }
+
     // Successful response: reset interval to default
     autoRefreshMs = 300000;
-    const data = await response.json();
+    const data = JSON.parse(resp.body);
     return {
       five_hour: data.five_hour ?? null,
       seven_day: data.seven_day ?? null,
@@ -399,7 +401,6 @@ async function fetchUsageLimits(token) {
       extra_usage: data.extra_usage ?? null,
     };
   } catch (e) {
-    if (e.name === 'AbortError') return { _error: 'Request timed out' };
     return { _error: 'Network error: ' + (e.message || 'unknown') };
   }
 }
@@ -926,7 +927,7 @@ function sendRpc(method, params = {}, id = 1) {
 // Main
 // ============================================================
 
-async function main() {
+function main() {
   const state = {
     loading: true,
     error: null,
@@ -956,7 +957,7 @@ async function main() {
     else render(state);
   }
 
-  async function refresh() {
+  function refresh() {
     state.loading = true;
     state.error = null;
     rerender();
@@ -969,7 +970,7 @@ async function main() {
         rerender();
         return;
       }
-      const data = await fetchUsageLimits(token);
+      const data = fetchUsageLimits(token);
       if (data && !data._error) {
         state.data = data;
         state.lastRefresh = Date.now();
@@ -1015,7 +1016,7 @@ async function main() {
     rerender();
   }
 
-  // Setup stdin BEFORE any await to keep the deno event loop alive.
+  // Setup stdin to keep the deno event loop alive.
   // Handle stdin for keyboard input
   // In Hecaton plugin mode, stdin is a pipe (not TTY), so rawMode is not needed.
   // The host forwards keystrokes as VT sequences directly.
@@ -1027,7 +1028,7 @@ async function main() {
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
 
-  process.stdin.on('data', async (key) => {
+  process.stdin.on('data', (key) => {
     // Host RPC – multiple RPCs can arrive in a single pipe read, so split
     // and process each one separately.
     if (key.indexOf('__HECA_RPC__') !== -1) {
@@ -1086,7 +1087,7 @@ async function main() {
       if (isRelease) continue;
 
       // Scroll wheel up -> refresh
-      if (cb === 64) { await refresh(); continue; }
+      if (cb === 64) { refresh(); continue; }
       if (cb === 65) continue; // scroll down -> ignore
 
       // Left click -> check clickable areas
@@ -1094,7 +1095,7 @@ async function main() {
         for (const area of clickableAreas) {
           if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
             switch (area.action) {
-              case 'refresh': await refresh(); break;
+              case 'refresh': refresh(); break;
               case 'heatmap_toggle':
                 if (!state.minimized) {
                   state.heatmapView = !state.heatmapView;
@@ -1115,7 +1116,7 @@ async function main() {
       case 'r':
       case 'R':
         if (state.heatmapView) refreshHeatmap();
-        else await refresh();
+        else refresh();
         break;
       case 'h':
       case 'H':
@@ -1136,8 +1137,8 @@ async function main() {
   let autoRefreshTimer = null;
   function scheduleAutoRefresh() {
     if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
-    autoRefreshTimer = setTimeout(async () => {
-      await refresh().catch(() => {});
+    autoRefreshTimer = setTimeout(() => {
+      try { refresh(); } catch { /* ignore */ }
       scheduleAutoRefresh();
     }, autoRefreshMs);
   }
@@ -1153,11 +1154,13 @@ async function main() {
   process.stdin.on('end', () => { cleanup(); process.exit(0); });
 
   // Start initial refresh and auto-refresh (AFTER stdin is registered)
-  await refresh();
+  refresh();
   scheduleAutoRefresh();
 }
 
-main().catch((e) => {
+try {
+  main();
+} catch (e) {
   process.stderr.write('Error: ' + e.message + '\n');
   process.exit(1);
-});
+}
