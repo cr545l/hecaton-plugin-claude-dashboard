@@ -937,14 +937,14 @@ async function main() {
     startTime: Date.now(),
     lastRefresh: null,
     refreshCount: 0,
-    minimized: false,
+    minimized: hecaton.initialState?.minimized ?? false,
     heatmapView: false,
     heatmapData: null,
     heatmapLoading: false,
   };
 
   // Initial render
-  render(state);
+  rerender();
 
   // Load config
   state.config = await loadConfig();
