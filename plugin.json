@@ -3,7 +3,6 @@
   "name": "Claude Dashboard",
   "version": "1.0.3",
   "entry": "main.js",
-  "runtime": "deno",
   "apiVersion": { "major": 1, "minor": 0 },
   "shortcut": { "key": "D", "mod": "ctrl+shift" },
   "overlay": {
