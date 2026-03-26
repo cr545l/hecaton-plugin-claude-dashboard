@@ -918,9 +918,8 @@ function renderHeatmap(state) {
 // JSON-RPC via stderr
 // ============================================================
 
-function sendRpc(method, params = {}, id = 1) {
-  const rpc = JSON.stringify({ jsonrpc: '2.0', method, params, id });
-  process.stderr.write('__HECA_RPC__' + rpc + '\n');
+function sendRpc(method, params = {}) {
+  hecaton[method](params).catch(() => {});
 }
 
 // ============================================================
