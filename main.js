@@ -1027,34 +1027,21 @@ async function main() {
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
 
-  process.stdin.on('data', (key) => {
-    // Host RPC – multiple RPCs can arrive in a single pipe read, so split
-    // and process each one separately.
-    if (key.indexOf('__HECA_RPC__') !== -1) {
-      const segments = key.split('__HECA_RPC__');
-      for (const seg of segments) {
-        const trimmed = seg.trim();
-        if (!trimmed) continue;
-        try {
-          const json = JSON.parse(trimmed);
-          if (json.method === 'resize' && json.params) {
-            termCols = json.params.cols || termCols;
-            termRows = json.params.rows || termRows;
-            rerender();
-          }
-          if (json.method === 'minimize') {
-            state.minimized = true;
-            renderMinimized(state);
-          }
-          if (json.method === 'restore') {
-            state.minimized = false;
-            rerender();
-          }
-        } catch { /* ignore malformed segment */ }
-      }
-      return;
-    }
+  hecaton.on('resize', (params) => {
+    termCols = params.cols || termCols;
+    termRows = params.rows || termRows;
+    rerender();
+  });
+  hecaton.on('minimize', () => {
+    state.minimized = true;
+    renderMinimized(state);
+  });
+  hecaton.on('restore', () => {
+    state.minimized = false;
+    rerender();
+  });
 
+  process.stdin.on('data', (key) => {
     // Handle SGR mouse sequences: ESC [ < Cb ; Cx ; Cy M/m
     const mouseRegex = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
     let mouseMatch;
