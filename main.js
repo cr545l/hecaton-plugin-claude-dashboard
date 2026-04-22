@@ -21,8 +21,8 @@ function joinPath(...parts) {
 }
 
 // Read plugin.json inline (synchronous hecaton call)
-const _pluginJsonResult = await hecaton.fs_read_file({ path: joinPath(__dirname, 'plugin.json') });
-const PLUGIN_VERSION = _pluginJsonResult.ok ? JSON.parse(_pluginJsonResult.text).version : '0.0.0';
+const _pluginJsonResult = await hecaton.fs.read_file({ path: joinPath(__dirname, 'plugin.json') });
+const PLUGIN_VERSION = _pluginJsonResult.ok ? JSON.parse(_pluginJsonResult.content).version : '0.0.0';
 
 // ============================================================
 // ANSI Helpers
@@ -114,11 +114,11 @@ function toLocalDateStr(date) {
 
 async function loadStatsCache() {
   try {
-    const home = (await hecaton.get_home_dir()).home;
+    const home = (await hecaton.env.get_home()).path;
     const cachePath = joinPath(home, '.claude', 'stats-cache.json');
-    const result = await hecaton.fs_read_file({ path: cachePath });
+    const result = await hecaton.fs.read_file({ path: cachePath });
     if (!result.ok) return null;
-    return JSON.parse(result.text);
+    return JSON.parse(result.content);
   } catch {
     return null;
   }
@@ -126,25 +126,25 @@ async function loadStatsCache() {
 
 async function scanRecentActivity(afterDate) {
   const activity = new Map();
-  const home = (await hecaton.get_home_dir()).home;
+  const home = (await hecaton.env.get_home()).path;
   const projectsDir = joinPath(home, '.claude', 'projects');
-  const statResult = await hecaton.fs_stat({ path: projectsDir });
+  const statResult = await hecaton.fs.stat({ path: projectsDir });
   if (!statResult.ok || !statResult.exists) return activity;
   const cutoff = afterDate ? new Date(afterDate).getTime() : 0;
 
   async function scanDir(dir) {
     try {
-      const dirResult = await hecaton.fs_read_dir({ path: dir });
+      const dirResult = await hecaton.fs.read_dir({ path: dir });
       if (!dirResult.ok) return;
       for (const entry of dirResult.entries) {
         const fullPath = joinPath(dir, entry.name);
-        if (entry.isDirectory) {
+        if (entry.is_dir) {
           await scanDir(fullPath);
         } else if (entry.name.endsWith('.jsonl')) {
           try {
-            const st = await hecaton.fs_stat({ path: fullPath });
-            if (st.ok && st.mtimeMs > cutoff) {
-              const dateStr = toLocalDateStr(new Date(st.mtimeMs));
+            const st = await hecaton.fs.stat({ path: fullPath });
+            if (st.ok && st.mtime_ms > cutoff) {
+              const dateStr = toLocalDateStr(new Date(st.mtime_ms));
               activity.set(dateStr, (activity.get(dateStr) || 0) + 1);
             }
           } catch { /* skip */ }
@@ -289,7 +289,7 @@ let credentialsCache = null;
 
 async function getCredentials() {
   try {
-    const platform = await hecaton.get_platform();
+    const platform = await hecaton.sys.get_platform();
     if (platform.os === 'macos') {
       return await getCredentialsFromKeychain();
     }
@@ -301,10 +301,10 @@ async function getCredentials() {
 
 async function getCredentialsFromKeychain() {
   try {
-    const result = await hecaton.exec_process({
+    const result = await hecaton.process.exec({
       program: 'security',
       args: ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-      timeout: 5000,
+      timeout_ms: 5000,
     });
     if (!result.ok) return await getCredentialsFromFile();
     const creds = JSON.parse(result.stdout.trim());
@@ -316,18 +316,18 @@ async function getCredentialsFromKeychain() {
 
 async function getCredentialsFromFile() {
   try {
-    const homeResult = await hecaton.get_home_dir();
-    const home = homeResult ? homeResult.home : null;
+    const homeResult = await hecaton.env.get_home();
+    const home = homeResult ? homeResult.path : null;
     if (!home) {
-      process.stderr.write('[claude-dashboard] get_home_dir failed: ' + JSON.stringify(homeResult) + '\n');
+      process.stderr.write('[claude-dashboard] env.get_home failed: ' + JSON.stringify(homeResult) + '\n');
       return null;
     }
     const credPath = joinPath(home, '.claude', '.credentials.json');
     process.stderr.write('[claude-dashboard] Reading credentials from: ' + credPath + '\n');
-    const result = await hecaton.fs_read_file({ path: credPath });
-    process.stderr.write('[claude-dashboard] fs_read_file result: ok=' + result.ok + ' error=' + (result.error || 'none') + '\n');
+    const result = await hecaton.fs.read_file({ path: credPath });
+    process.stderr.write('[claude-dashboard] fs.read_file result: ok=' + result.ok + ' error=' + (result.error || 'none') + '\n');
     if (!result.ok) return null;
-    const creds = JSON.parse(result.text);
+    const creds = JSON.parse(result.content);
     return creds?.claudeAiOauth?.accessToken ?? null;
   } catch (e) {
     process.stderr.write('[claude-dashboard] getCredentialsFromFile error: ' + (e.message || e) + '\n');
@@ -342,14 +342,14 @@ const PLUGIN_DIR_NAME = (function() {
   const parts = __dirname.replace(/\\/g, '/').split('/').filter(Boolean);
   return parts[parts.length - 1] || 'hecaton-plugin-claude-dashboard';
 })();
-const CACHE_DIR = joinPath((await hecaton.get_home_dir()).home, '.hecaton', 'data', PLUGIN_DIR_NAME);
+const CACHE_DIR = joinPath((await hecaton.env.get_home()).path, '.hecaton', 'data', PLUGIN_DIR_NAME);
 const CACHE_FILE = joinPath(CACHE_DIR, 'cache.json');
 
 async function loadCache() {
   try {
-    const result = await hecaton.fs_read_file({ path: CACHE_FILE });
+    const result = await hecaton.fs.read_file({ path: CACHE_FILE });
     if (!result.ok) return null;
-    return JSON.parse(result.text);
+    return JSON.parse(result.content);
   } catch {
     return null;
   }
@@ -357,14 +357,14 @@ async function loadCache() {
 
 async function saveCache(data) {
   try {
-    await hecaton.fs_mkdir({ path: CACHE_DIR, recursive: true });
-    await hecaton.fs_write_file({ path: CACHE_FILE, text: JSON.stringify({ ...data, _cachedAt: Date.now() }) });
+    await hecaton.fs.mkdir({ path: CACHE_DIR, recursive: true });
+    await hecaton.fs.write_file({ path: CACHE_FILE, content: JSON.stringify({ ...data, _cachedAt: Date.now() }) });
   } catch { /* ignore write errors */ }
 }
 
 async function fetchUsageLimits(token) {
   try {
-    const resp = await hecaton.http_get({
+    const resp = await hecaton.http.get({
       url: 'https://api.anthropic.com/api/oauth/usage',
       headers: {
         'Accept': 'application/json',
@@ -373,7 +373,7 @@ async function fetchUsageLimits(token) {
         'Authorization': `Bearer ${token}`,
         'anthropic-beta': 'oauth-2025-04-20',
       },
-      timeoutSec: 5,
+      timeout_sec: 5,
     });
 
     if (!resp.ok) {
@@ -411,11 +411,11 @@ async function fetchUsageLimits(token) {
 
 async function loadConfig() {
   try {
-    const home = (await hecaton.get_home_dir()).home;
+    const home = (await hecaton.env.get_home()).path;
     const configPath = joinPath(home, '.claude', 'claude-dashboard.local.json');
-    const result = await hecaton.fs_read_file({ path: configPath });
+    const result = await hecaton.fs.read_file({ path: configPath });
     if (!result.ok) return { plan: 'max', displayMode: 'detailed', language: 'auto' };
-    return { plan: 'max', displayMode: 'detailed', ...JSON.parse(result.text) };
+    return { plan: 'max', displayMode: 'detailed', ...JSON.parse(result.content) };
   } catch {
     return { plan: 'max', displayMode: 'detailed', language: 'auto' };
   }
@@ -423,11 +423,11 @@ async function loadConfig() {
 
 async function getEffortLevel() {
   try {
-    const home = (await hecaton.get_home_dir()).home;
+    const home = (await hecaton.env.get_home()).path;
     const settingsPath = joinPath(home, '.claude', 'settings.json');
-    const result = await hecaton.fs_read_file({ path: settingsPath });
+    const result = await hecaton.fs.read_file({ path: settingsPath });
     if (!result.ok) return 'high';
-    const settings = JSON.parse(result.text);
+    const settings = JSON.parse(result.content);
     return settings?.effortLevel ?? 'high';
   } catch {
     return 'high';
@@ -484,8 +484,8 @@ function formatResetTime(resetAt) {
 // ============================================================
 
 // Dynamic terminal size (updated by host resize notifications)
-let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '80', 10);
-let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '24', 10);
+let termCols = parseInt((await hecaton.env.get({ name: 'HECA_COLS' })).value || '80', 10);
+let termRows = parseInt((await hecaton.env.get({ name: 'HECA_ROWS' })).value || '24', 10);
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
@@ -919,7 +919,17 @@ function renderHeatmap(state) {
 // ============================================================
 
 function sendRpc(method, params = {}) {
-  hecaton[method](params).catch(() => {});
+  // Support dotted paths like "window.close" for v1.0 namespaced API.
+  const parts = method.split('.');
+  let target = hecaton;
+  for (let i = 0; i < parts.length - 1; i++) {
+    target = target?.[parts[i]];
+    if (!target) return;
+  }
+  const fn = target?.[parts[parts.length - 1]];
+  if (typeof fn === 'function') {
+    fn.call(target, params).catch(() => {});
+  }
 }
 
 // ============================================================
@@ -1027,16 +1037,16 @@ async function main() {
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
 
-  hecaton.on('resize', (params) => {
+  hecaton.on('window_resized', (params) => {
     termCols = params.cols || termCols;
     termRows = params.rows || termRows;
     rerender();
   });
-  hecaton.on('minimize', () => {
+  hecaton.on('window_minimized', () => {
     state.minimized = true;
     renderMinimized(state);
   });
-  hecaton.on('restore', () => {
+  hecaton.on('window_restored', () => {
     state.minimized = false;
     rerender();
   });
@@ -1114,7 +1124,7 @@ async function main() {
       case 'q':
       case 'Q':
         cleanup();
-        sendRpc('close');
+        sendRpc('window.close');
         break;
     }
   });
