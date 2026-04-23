@@ -914,23 +914,8 @@ function renderHeatmap(state) {
   if (hoveredAreaIndex >= clickableAreas.length) hoveredAreaIndex = -1;
 }
 
-// ============================================================
-// JSON-RPC via stderr
-// ============================================================
-
-function sendRpc(method, params = {}) {
-  // Support dotted paths like "window.close" for v1.0 namespaced API.
-  const parts = method.split('.');
-  let target = hecaton;
-  for (let i = 0; i < parts.length - 1; i++) {
-    target = target?.[parts[i]];
-    if (!target) return;
-  }
-  const fn = target?.[parts[parts.length - 1]];
-  if (typeof fn === 'function') {
-    fn.call(target, params).catch(() => {});
-  }
-}
+// JSON-RPC via the v1.0 namespace API (hecaton.<ns>.<verb>) — the legacy
+// sendRpc dispatcher was removed in favor of direct proxy calls.
 
 // ============================================================
 // Main
@@ -1124,7 +1109,7 @@ async function main() {
       case 'q':
       case 'Q':
         cleanup();
-        sendRpc('window.close');
+        hecaton.window.close().catch(() => {});
         break;
     }
   });
