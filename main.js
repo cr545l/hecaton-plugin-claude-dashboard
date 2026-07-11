@@ -398,6 +398,7 @@ async function fetchUsageLimits(token) {
       five_hour: data.five_hour ?? null,
       seven_day: data.seven_day ?? null,
       seven_day_sonnet: data.seven_day_sonnet ?? null,
+      limits: Array.isArray(data.limits) ? data.limits : [],
       extra_usage: data.extra_usage ?? null,
     };
   } catch (e) {
@@ -479,6 +480,26 @@ function formatResetTime(resetAt) {
   }
 }
 
+function getFableLimit(data) {
+  if (!Array.isArray(data?.limits)) return null;
+
+  const limit = data.limits.find((item) => {
+    const displayName = item?.scope?.model?.display_name;
+    return item?.kind === 'weekly_scoped' &&
+      typeof displayName === 'string' &&
+      displayName.trim().toLowerCase() === 'fable';
+  });
+  if (!limit) return null;
+
+  const utilization = Number(limit.percent);
+  if (!Number.isFinite(utilization)) return null;
+
+  return {
+    utilization,
+    resets_at: limit.resets_at ?? null,
+  };
+}
+
 // ============================================================
 // Rendering
 // ============================================================
@@ -547,6 +568,8 @@ function renderMinimized(state) {
   let line = '';
 
   if (data) {
+    const fable = getFableLimit(data);
+
     if (data.five_hour) {
       const pct = Math.round(data.five_hour.utilization);
       const reset = formatResetTime(data.five_hour.resets_at);
@@ -556,8 +579,14 @@ function renderMinimized(state) {
     if (data.seven_day) {
       const pct = Math.round(data.seven_day.utilization);
       const reset = formatResetTime(data.seven_day.resets_at);
-      line += colors.dim + ' | ' + ansi.reset;
+      if (line) line += colors.dim + ' | ' + ansi.reset;
       line += colors.label + (reset || '7d') + ': ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+    }
+    if (fable) {
+      const pct = Math.round(fable.utilization);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
+      line += colors.label + 'Fable: ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
     }
 
@@ -569,7 +598,7 @@ function renderMinimized(state) {
       const utilization = eu.utilization != null ? eu.utilization / 100 : 0;
       const pctDisplay = Math.round(utilization * 100);
       const usageColor = colorForExtraUsage(utilization);
-      line += colors.dim + ' | ' + ansi.reset;
+      if (line) line += colors.dim + ' | ' + ansi.reset;
       const label = limitCents != null && limitCents > 0
         ? formatCents(limitCents - usedCents)
         : formatCents(usedCents);
@@ -638,12 +667,14 @@ function render(state) {
     lines.push('  ' + drawSeparator(width - 3));
 
     if (data && !data._error) {
+      const fable = getFableLimit(data);
+
       // 5-hour
       if (data.five_hour) {
         const pct = Math.round(data.five_hour.utilization);
         const reset = formatResetTime(data.five_hour.resets_at);
         lines.push(
-          '  ' + colors.label + '5h   ' + ansi.reset +
+          '  ' + colors.label + '5h    ' + ansi.reset +
           progressBar(pct, 25) + '  ' + formatPercent(pct) +
           (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
         );
@@ -654,7 +685,7 @@ function render(state) {
         const pct = Math.round(data.seven_day.utilization);
         const reset = formatResetTime(data.seven_day.resets_at);
         lines.push(
-          '  ' + colors.label + '7d   ' + ansi.reset +
+          '  ' + colors.label + '7d    ' + ansi.reset +
           progressBar(pct, 25) + '  ' + formatPercent(pct) +
           (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
         );
@@ -665,13 +696,24 @@ function render(state) {
         const pct = Math.round(data.seven_day_sonnet.utilization);
         const reset = formatResetTime(data.seven_day_sonnet.resets_at);
         lines.push(
-          '  ' + colors.label + '7d-S ' + ansi.reset +
+          '  ' + colors.label + '7d-S  ' + ansi.reset +
           progressBar(pct, 25) + '  ' + formatPercent(pct) +
           (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
         );
       }
 
-      if (!data.five_hour && !data.seven_day && !data.seven_day_sonnet) {
+      // 7-day Fable
+      if (fable) {
+        const pct = Math.round(fable.utilization);
+        const reset = formatResetTime(fable.resets_at);
+        lines.push(
+          '  ' + colors.label + 'Fable ' + ansi.reset +
+          progressBar(pct, 25) + '  ' + formatPercent(pct) +
+          (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
+        );
+      }
+
+      if (!data.five_hour && !data.seven_day && !data.seven_day_sonnet && !fable) {
         lines.push('  ' + colors.dim + 'No rate limit data available' + ansi.reset);
       }
 
