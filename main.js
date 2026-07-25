@@ -480,6 +480,41 @@ function formatResetTime(resetAt) {
   }
 }
 
+// Exact local wall-clock time: 2026-07-26 14:30
+function formatExactTime(timestamp) {
+  if (!timestamp) return null;
+  try {
+    const d = new Date(timestamp);
+    if (Number.isNaN(d.getTime())) return null;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch {
+    return null;
+  }
+}
+
+// Full remaining duration without truncation: 2d 3h 20m
+function formatDurationLong(ms) {
+  const totalMin = Math.floor(ms / 60000);
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const minutes = totalMin % 60;
+  const parts = [];
+  if (days > 0) parts.push(days + 'd');
+  if (hours > 0) parts.push(hours + 'h');
+  parts.push(minutes + 'm');
+  return parts.join(' ');
+}
+
+function buildResetTooltip(label, resetAt) {
+  const exact = formatExactTime(resetAt);
+  if (!exact) return null;
+  const remainMs = new Date(resetAt).getTime() - Date.now();
+  const remaining = remainMs > 0 ? formatDurationLong(remainMs) : 'now';
+  return `${label}\nResets: ${exact}\nRemaining: ${remaining}`;
+}
+
 function getFableLimit(data) {
   if (!Array.isArray(data?.limits)) return null;
 
@@ -510,6 +545,32 @@ let termRows = parseInt((await hecaton.env.get({ name: 'HECA_ROWS' })).value || 
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
+// Hover areas of the minimized bar: { colStart, colEnd, label, resetAt } (1-based cols)
+let minimizedTooltipAreas = [];
+let lastTooltipText = null;
+
+function setTooltip(text) {
+  if (text === lastTooltipText) return;
+  lastTooltipText = text;
+  try {
+    hecaton.window.set_tooltip({ text }).catch(() => {});
+  } catch { /* host without tooltip support */ }
+}
+
+// Mouse coords are 1-based; the minimized bar is drawn on row 1.
+function updateMinimizedTooltip(cx, cy) {
+  let text = '';
+  if (cy === 1) {
+    for (const area of minimizedTooltipAreas) {
+      if (cx >= area.colStart && cx <= area.colEnd) {
+        // Built on hover so the remaining time never goes stale between renders
+        text = buildResetTooltip(area.label, area.resetAt) || '';
+        break;
+      }
+    }
+  }
+  setTooltip(text);
+}
 
 function buildHintText(buttons) {
   let result = '';
@@ -567,27 +628,46 @@ function renderMinimized(state) {
   const data = state.data;
   let line = '';
 
+  // The minimized bar has no buttons; drop areas left over from the full view
+  clickableAreas = [];
+  minimizedTooltipAreas = [];
+
+  const plainLength = () => line.replace(/\x1b\[[0-9;]*m/g, '').length;
+  const addTooltipArea = (startIdx, label, resetAt) => {
+    if (!resetAt) return;
+    const endIdx = plainLength();
+    if (endIdx > startIdx) {
+      minimizedTooltipAreas.push({ colStart: startIdx + 1, colEnd: endIdx, label, resetAt });
+    }
+  };
+
   if (data) {
     const fable = getFableLimit(data);
 
     if (data.five_hour) {
       const pct = Math.round(data.five_hour.utilization);
       const reset = formatResetTime(data.five_hour.resets_at);
+      const segStart = plainLength();
       line += colors.label + (reset || '5h') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, '5-hour limit', data.five_hour.resets_at);
     }
     if (data.seven_day) {
       const pct = Math.round(data.seven_day.utilization);
       const reset = formatResetTime(data.seven_day.resets_at);
       if (line) line += colors.dim + ' | ' + ansi.reset;
+      const segStart = plainLength();
       line += colors.label + (reset || '7d') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, '7-day limit', data.seven_day.resets_at);
     }
     if (fable) {
       const pct = Math.round(fable.utilization);
       if (line) line += colors.dim + ' | ' + ansi.reset;
+      const segStart = plainLength();
       line += colors.label + 'Fable: ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, 'Fable weekly limit', fable.resets_at);
     }
 
     // Extra usage in minimized mode
@@ -1075,6 +1155,7 @@ async function main() {
   });
   hecaton.on('window_restored', () => {
     state.minimized = false;
+    setTooltip('');
     rerender();
   });
 
@@ -1092,6 +1173,10 @@ async function main() {
 
       // Motion events (cb bit 5 set)
       if ((cb & 32) !== 0) {
+        if (state.minimized) {
+          updateMinimizedTooltip(cx, cy);
+          continue;
+        }
         let newHover = -1;
         for (let i = 0; i < clickableAreas.length; i++) {
           const area = clickableAreas[i];
@@ -1168,6 +1253,7 @@ async function main() {
 
   function cleanup() {
     clearTimeout(autoRefreshTimer);
+    setTooltip('');
     process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
   }
 
