@@ -336,6 +336,8 @@ async function getCredentialsFromFile() {
 }
 
 let autoRefreshMs = 300000; // 5 minutes default
+const CLAUDE_STATUS_URL = 'https://status.claude.com/api/v2/summary.json';
+const MINIMIZED_OUTAGE_LABEL = 'DOWN';
 
 const PLUGIN_DIR_NAME = (function() {
   // Extract directory name from __dirname
@@ -403,6 +405,53 @@ async function fetchUsageLimits(token) {
     };
   } catch (e) {
     return { _error: 'Network error: ' + (e.message || 'unknown') };
+  }
+}
+
+async function fetchClaudeStatus() {
+  try {
+    const resp = await hecaton.http.get({
+      url: CLAUDE_STATUS_URL,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'hecaton-claude-dashboard/1.0',
+      },
+      timeout_sec: 5,
+    });
+
+    if (!resp.ok) {
+      return { _error: 'Status check failed: ' + (resp.error || 'Request failed') };
+    }
+    if (resp.status !== 200) {
+      return { _error: `Status check failed (HTTP ${resp.status})` };
+    }
+
+    const data = JSON.parse(resp.body);
+    const validIndicators = new Set(['none', 'minor', 'major', 'critical']);
+    const rawIndicator = data?.status?.indicator;
+    const indicator = validIndicators.has(rawIndicator) ? rawIndicator : 'unknown';
+    const components = Array.isArray(data?.components) ? data.components : [];
+    const incidents = Array.isArray(data?.incidents) ? data.incidents : [];
+    const affectedComponents = components
+      .filter(component => component?.status && component.status !== 'operational')
+      .map(component => ({
+        name: component.name || 'Unknown component',
+        status: component.status,
+      }));
+
+    return {
+      indicator,
+      description: data?.status?.description || 'Status unavailable',
+      hasIssue:
+        (indicator !== 'none' && indicator !== 'unknown') ||
+        affectedComponents.length > 0 ||
+        incidents.length > 0,
+      affectedComponents,
+      incidentName: incidents[0]?.name || null,
+      checkedAt: Date.now(),
+    };
+  } catch (e) {
+    return { _error: 'Status check failed: ' + (e.message || 'unknown') };
   }
 }
 
@@ -606,6 +655,42 @@ function truncate(text, maxLen) {
   return text.substring(0, maxLen - 3) + '...';
 }
 
+function colorForServiceIndicator(indicator) {
+  if (indicator === 'critical' || indicator === 'major') return colors.red;
+  if (indicator === 'minor') return colors.yellow;
+  if (indicator === 'none') return colors.green;
+  return colors.dim;
+}
+
+function appendServiceStatusMessage(lines, state, width) {
+  const status = state.serviceStatus;
+  const maxTextWidth = Math.max(12, width - 4);
+
+  if (!status) {
+    lines.push(centerText(colors.dim + 'Claude Status: Checking...' + ansi.reset, width));
+    return;
+  }
+  if (status._error) {
+    lines.push(centerText(colors.yellow + 'Claude Status: Unavailable' + ansi.reset, width));
+    return;
+  }
+
+  const statusColor = colorForServiceIndicator(status.indicator);
+  const statusText = truncate('Claude Status: ' + status.description, maxTextWidth);
+  lines.push(centerText(statusColor + ansi.bold + statusText + ansi.reset, width));
+
+  if (status.hasIssue) {
+    const details = [];
+    if (status.incidentName) details.push(status.incidentName);
+    if (status.affectedComponents.length > 0) {
+      details.push('Affected: ' + status.affectedComponents.map(component => component.name).join(', '));
+    }
+    if (details.length > 0) {
+      lines.push(centerText(colors.dim + truncate(details.join(' | '), maxTextWidth) + ansi.reset, width));
+    }
+  }
+}
+
 function drawBox(lines, width) {
   const topBorder = colors.border + '\u250c' + '\u2500'.repeat(width - 2) + '\u2510' + ansi.reset;
   const botBorder = colors.border + '\u2514' + '\u2500'.repeat(width - 2) + '\u2518' + ansi.reset;
@@ -641,12 +726,19 @@ function renderMinimized(state) {
     }
   };
 
+  const serviceStatus = state.serviceStatus;
+  if (serviceStatus && !serviceStatus._error && serviceStatus.hasIssue) {
+    const statusColor = colorForServiceIndicator(serviceStatus.indicator);
+    line += statusColor + ansi.bold + MINIMIZED_OUTAGE_LABEL + ansi.reset;
+  }
+
   if (data) {
     const fable = getFableLimit(data);
 
     if (data.five_hour) {
       const pct = Math.round(data.five_hour.utilization);
       const reset = formatResetTime(data.five_hour.resets_at);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
       const segStart = plainLength();
       line += colors.label + (reset || '5h') + ': ' + ansi.reset;
       line += formatPercent(pct) + ' ' + progressBar(pct, 10);
@@ -718,6 +810,9 @@ function render(state) {
     colors.dim + 'v' + PLUGIN_VERSION + ansi.reset,
     width
   ));
+  lines.push('');
+
+  appendServiceStatusMessage(lines, state, width);
   lines.push('');
 
   if (state.error) {
@@ -923,6 +1018,9 @@ function renderHeatmap(state) {
   ));
   lines.push('');
 
+  appendServiceStatusMessage(lines, state, width);
+  lines.push('');
+
   if (state.heatmapLoading) {
     lines.push(centerText(colors.dim + 'Loading heatmap data...' + ansi.reset, width));
   } else if (!state.heatmapData) {
@@ -1057,6 +1155,7 @@ async function main() {
     heatmapView: false,
     heatmapData: null,
     heatmapLoading: false,
+    serviceStatus: null,
   };
 
   // Initial render
@@ -1078,15 +1177,22 @@ async function main() {
     state.error = null;
     rerender();
 
+    const statusPromise = fetchClaudeStatus();
+
     try {
       const token = await getCredentials();
       if (!token) {
+        state.serviceStatus = await statusPromise;
         state.error = 'No credentials found';
         state.loading = false;
         rerender();
         return;
       }
-      const data = await fetchUsageLimits(token);
+      const [data, serviceStatus] = await Promise.all([
+        fetchUsageLimits(token),
+        statusPromise,
+      ]);
+      state.serviceStatus = serviceStatus;
       if (data && !data._error) {
         state.data = data;
         state.lastRefresh = Date.now();
