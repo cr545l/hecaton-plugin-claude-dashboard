@@ -338,6 +338,8 @@ async function getCredentialsFromFile() {
 let autoRefreshMs = 300000; // 5 minutes default
 const CLAUDE_STATUS_URL = 'https://status.claude.com/api/v2/summary.json';
 const MINIMIZED_OUTAGE_LABEL = 'DOWN';
+const STATUS_REFRESH_NORMAL_MS = 300000; // 5 minutes
+const STATUS_REFRESH_OUTAGE_MS = 30000;  // 30 seconds
 
 const PLUGIN_DIR_NAME = (function() {
   // Extract directory name from __dirname
@@ -453,6 +455,44 @@ async function fetchClaudeStatus() {
   } catch (e) {
     return { _error: 'Status check failed: ' + (e.message || 'unknown') };
   }
+}
+
+async function sendServiceRecoveryNotification() {
+  try {
+    await hecaton.notify.send({
+      title: 'Claude Service Restored',
+      body: 'Claude services are operational again.',
+    });
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] Recovery notification failed: ' + (e.message || e) + '\n');
+  }
+}
+
+async function requestNotificationPermissionOnStartup() {
+  try {
+    const current = await hecaton.permissions.query({
+      permission: 'notification',
+    });
+
+    if (current.state !== 'prompt') return current;
+
+    return await hecaton.permissions.request({
+      permission: 'notification',
+    });
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] Notification permission preflight failed: ' + (e.message || e) + '\n');
+    return { granted: false, state: 'unavailable' };
+  }
+}
+
+function applyServiceStatusResult(state, serviceStatus) {
+  const wasDown = state.lastKnownServiceIssue === true;
+  state.serviceStatus = serviceStatus;
+
+  if (serviceStatus._error) return false;
+
+  state.lastKnownServiceIssue = serviceStatus.hasIssue;
+  return wasDown && !serviceStatus.hasIssue;
 }
 
 // ============================================================
@@ -727,8 +767,13 @@ function renderMinimized(state) {
   };
 
   const serviceStatus = state.serviceStatus;
-  if (serviceStatus && !serviceStatus._error && serviceStatus.hasIssue) {
-    const statusColor = colorForServiceIndicator(serviceStatus.indicator);
+  const serviceIsDown = serviceStatus && !serviceStatus._error
+    ? serviceStatus.hasIssue
+    : state.lastKnownServiceIssue === true;
+  if (serviceIsDown) {
+    const statusColor = serviceStatus && !serviceStatus._error
+      ? colorForServiceIndicator(serviceStatus.indicator)
+      : colors.red;
     line += statusColor + ansi.bold + MINIMIZED_OUTAGE_LABEL + ansi.reset;
   }
 
@@ -1156,7 +1201,12 @@ async function main() {
     heatmapData: null,
     heatmapLoading: false,
     serviceStatus: null,
+    lastKnownServiceIssue: null,
   };
+  let autoRefreshTimer = null;
+  let serviceStatusRefreshTimer = null;
+  let serviceStatusRefreshPromise = null;
+  let shuttingDown = false;
 
   // Initial render
   rerender();
@@ -1172,27 +1222,40 @@ async function main() {
     else render(state);
   }
 
+  async function refreshServiceStatus() {
+    if (serviceStatusRefreshPromise) return serviceStatusRefreshPromise;
+
+    serviceStatusRefreshPromise = (async () => {
+      const serviceStatus = await fetchClaudeStatus();
+      const recovered = applyServiceStatusResult(state, serviceStatus);
+
+      rerender();
+      if (recovered) await sendServiceRecoveryNotification();
+      return serviceStatus;
+    })();
+
+    try {
+      return await serviceStatusRefreshPromise;
+    } finally {
+      serviceStatusRefreshPromise = null;
+      scheduleServiceStatusRefresh();
+    }
+  }
+
   async function refresh() {
     state.loading = true;
     state.error = null;
     rerender();
 
-    const statusPromise = fetchClaudeStatus();
-
     try {
       const token = await getCredentials();
       if (!token) {
-        state.serviceStatus = await statusPromise;
         state.error = 'No credentials found';
         state.loading = false;
         rerender();
         return;
       }
-      const [data, serviceStatus] = await Promise.all([
-        fetchUsageLimits(token),
-        statusPromise,
-      ]);
-      state.serviceStatus = serviceStatus;
+      const data = await fetchUsageLimits(token);
       if (data && !data._error) {
         state.data = data;
         state.lastRefresh = Date.now();
@@ -1224,6 +1287,11 @@ async function main() {
       state.loading = false;
       rerender();
     }
+  }
+
+  function refreshDashboard() {
+    refresh();
+    refreshServiceStatus();
   }
 
   async function refreshHeatmap() {
@@ -1301,7 +1369,7 @@ async function main() {
       if (isRelease) continue;
 
       // Scroll wheel up -> refresh
-      if (cb === 64) { refresh(); continue; }
+      if (cb === 64) { refreshDashboard(); continue; }
       if (cb === 65) continue; // scroll down -> ignore
 
       // Left click -> check clickable areas
@@ -1309,7 +1377,7 @@ async function main() {
         for (const area of clickableAreas) {
           if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
             switch (area.action) {
-              case 'refresh': refresh(); break;
+              case 'refresh': refreshDashboard(); break;
               case 'heatmap_toggle':
                 if (!state.minimized) {
                   state.heatmapView = !state.heatmapView;
@@ -1329,8 +1397,12 @@ async function main() {
     switch (key) {
       case 'r':
       case 'R':
-        if (state.heatmapView) refreshHeatmap();
-        else refresh();
+        if (state.heatmapView) {
+          refreshHeatmap();
+          refreshServiceStatus();
+        } else {
+          refreshDashboard();
+        }
         break;
       case 'h':
       case 'H':
@@ -1348,8 +1420,8 @@ async function main() {
   });
 
   // Auto-refresh with dynamic interval (backs off on 429)
-  let autoRefreshTimer = null;
   function scheduleAutoRefresh() {
+    if (shuttingDown) return;
     if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
     autoRefreshTimer = setTimeout(async () => {
       try { await refresh(); } catch { /* ignore */ }
@@ -1357,8 +1429,21 @@ async function main() {
     }, autoRefreshMs);
   }
 
+  function scheduleServiceStatusRefresh() {
+    if (shuttingDown) return;
+    if (serviceStatusRefreshTimer) clearTimeout(serviceStatusRefreshTimer);
+    const refreshMs = state.lastKnownServiceIssue === true
+      ? STATUS_REFRESH_OUTAGE_MS
+      : STATUS_REFRESH_NORMAL_MS;
+    serviceStatusRefreshTimer = setTimeout(() => {
+      refreshServiceStatus().catch(() => {});
+    }, refreshMs);
+  }
+
   function cleanup() {
+    shuttingDown = true;
     clearTimeout(autoRefreshTimer);
+    clearTimeout(serviceStatusRefreshTimer);
     setTooltip('');
     process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
   }
@@ -1368,8 +1453,13 @@ async function main() {
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.stdin.on('end', () => { cleanup(); process.exit(0); });
 
+  // Request notification permission before monitoring starts.
+  await requestNotificationPermissionOnStartup();
+  if (shuttingDown) return;
+
   // Start initial refresh and auto-refresh (AFTER stdin is registered)
   refresh();
+  refreshServiceStatus();
   scheduleAutoRefresh();
 }
 
