@@ -1211,6 +1211,9 @@ async function main() {
   // Initial render
   rerender();
 
+  // Request notification permission before user config reads and monitoring.
+  await requestNotificationPermissionOnStartup();
+
   // Load config
   state.config = await loadConfig();
   state.effort = await getEffortLevel();
@@ -1452,10 +1455,6 @@ async function main() {
   process.on('SIGTERM', () => { cleanup(); process.exit(0); });
   process.on('SIGINT', () => { cleanup(); process.exit(0); });
   process.stdin.on('end', () => { cleanup(); process.exit(0); });
-
-  // Request notification permission before monitoring starts.
-  await requestNotificationPermissionOnStartup();
-  if (shuttingDown) return;
 
   // Start initial refresh and auto-refresh (AFTER stdin is registered)
   refresh();
