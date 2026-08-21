@@ -748,6 +748,31 @@ function drawSeparator(width) {
   return colors.separator + '\u2500'.repeat(width - 2) + ansi.reset;
 }
 
+// \ud45c\uc2dc \ud3ed \uae30\uc900\uc73c\ub85c \uc790\ub974\ub418 SGR \uc2dc\ud000\uc2a4\ub294 \ud3ed\uc5d0 \uc138\uc9c0 \uc54a\ub294\ub2e4.
+// \ucd5c\uc18c\ud654 \ubc14\ub294 \ud638\uc2a4\ud2b8 \ubc84\ud37c\uac00 1\ud589\uc774\ub77c, \ud3ed\uc744 \ud55c \uce78\uc774\ub77c\ub3c4 \ub118\uae30\uba74 \uc624\ud1a0\ub7a9\uc774 \uc2a4\ud06c\ub864\uc744
+// \uc77c\uc73c\ucf1c \ubc29\uae08 \uadf8\ub9b0 \uc904\uc774 \ud1b5\uc9f8\ub85c \uc0ac\ub77c\uc9c4\ub2e4(= \ub77c\ubca8\ub9cc \ub0a8\uace0 \ube48 \ubc14). \ub118\uce60 \ub9cc\ud55c \ubb38\uc790\uc5f4\uc740
+// \ubc18\ub4dc\uc2dc \uc5ec\uae30\ub97c \ud1b5\uacfc\uc2dc\ud0ac \uac83.
+function truncateAnsi(text, maxCols) {
+  const sgr = /\x1b\[[0-9;]*m/g;
+  let out = '';
+  let shown = 0;
+  let i = 0;
+  while (i < text.length) {
+    sgr.lastIndex = i;
+    const m = sgr.exec(text);
+    if (m && m.index === i) {
+      out += m[0];
+      i = sgr.lastIndex;
+      continue;
+    }
+    if (shown >= maxCols) break;
+    out += text[i];
+    shown++;
+    i++;
+  }
+  return out;
+}
+
 function renderMinimized(state) {
   const { cols } = getTermSize();
   const data = state.data;
@@ -825,6 +850,21 @@ function renderMinimized(state) {
     }
   }
 
+  // \uadf8\ub9b4 \uac8c \uc5c6\uc73c\uba74 \uc0c1\ud0dc\ub97c \uc801\ub294\ub2e4. \ube48 \ubc14\ub294 "\ud50c\ub7ec\uadf8\uc778\uc774 \uc8fd\uc5c8\ub098?"\ub85c \uc77d\ud788\uace0,
+  // \uc2e4\uc81c\ub85c \ub85c\ub529\uc740 \uc790\uaca9\uc99d\uba85 \uc870\ud68c + \ub124\ud2b8\uc6cc\ud06c\ub77c \uc218 \ucd08 \uc774\uc0c1 \uac78\ub9b0\ub2e4.
+  // \u26a0\ufe0f \uc870\uac74\uc774 `!data` \ub9cc\uc774\uba74 \uc548 \ub41c\ub2e4 \u2014 \uc751\ub2f5\uc740 \uc654\ub294\ub370 \ud55c\ub3c4 \ud56d\ubaa9\uc774 \ud558\ub098\ub3c4 \uc5c6\uc73c\uba74
+  //    data \ub294 truthy \uc778\ub370 \uc904\uc740 \uadf8\ub300\ub85c \ube44\uc5b4 \uc788\ub2e4. "\uc904\uc774 \ube44\uc5c8\ub294\uac00"\ub3c4 \ud568\uaed8 \ubcf8\ub2e4.
+  if (!data || plainLength() === 0) {
+    if (line) line += colors.dim + ' | ' + ansi.reset;
+    if (state.error) {
+      line += colors.red + state.error + ansi.reset;
+    } else if (state.loading) {
+      line += colors.dim + 'Loading...' + ansi.reset;
+    } else {
+      line += colors.dim + 'No data' + ansi.reset;
+    }
+  }
+
   if (state.lastRefresh) {
     const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
     const cacheTag = (state.data && state.data._fromCache) ? ' (cached)' : '';
@@ -833,7 +873,12 @@ function renderMinimized(state) {
   }
 
   // Pad/truncate to terminal width
-  const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  // \u26a0\ufe0f \uc790\ub974\uae30\uac00 \ube60\uc9c0\uba74 \uc548 \ub41c\ub2e4 \u2014 \ud3ed\uc744 \ub118\uae34 \uc904\uc740 1\ud589 \ubc84\ud37c\uc5d0\uc11c \uc2a4\ud06c\ub864\ub418\uc5b4 \ud1b5\uc9f8\ub85c \uc0ac\ub77c\uc9c4\ub2e4.
+  let plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  if (plain.length > cols) {
+    line = truncateAnsi(line, cols);
+    plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  }
   const pad = Math.max(0, cols - plain.length);
   line += ' '.repeat(pad);
 
