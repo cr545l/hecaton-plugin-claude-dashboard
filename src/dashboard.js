@@ -1,0 +1,1561 @@
+#!/usr/bin/env node
+
+/**
+ * Claude Dashboard - Hecaton Plugin
+ *
+ * Displays Claude API usage, rate limits, and session info
+ * as a TUI overlay inside the Hecaton terminal.
+ *
+ * Keyboard:
+ *   r / R   - Refresh data
+ *   h / H   - Toggle heatmap view
+ *   a / A   - Toggle agent state view
+ *   q / ESC - Close (handled by host)
+ */
+
+// ============================================================
+// Hecaton Host API helpers & path utilities
+// ============================================================
+
+function joinPath(...parts) {
+  return parts.join('/').replace(/\\/g, '/').replace(/\/+/g, '/');
+}
+
+// Read plugin.json inline (synchronous hecaton call)
+const _pluginJsonResult = await hecaton.fs.read_file({ path: joinPath(__dirname, 'plugin.json') });
+const PLUGIN_VERSION = _pluginJsonResult.ok ? JSON.parse(_pluginJsonResult.content).version : '0.0.0';
+
+// ============================================================
+// ANSI Helpers
+// ============================================================
+const ESC = '\x1b';
+const CSI = ESC + '[';
+
+const ansi = {
+  clear: CSI + '2J' + CSI + 'H',
+  hideCursor: CSI + '?25l',
+  showCursor: CSI + '?25h',
+  reset: CSI + '0m',
+  bold: CSI + '1m',
+  dim: CSI + '2m',
+  fg: (r, g, b) => `${CSI}38;2;${r};${g};${b}m`,
+  bg: (r, g, b) => `${CSI}48;2;${r};${g};${b}m`,
+  fg256: (n) => `${CSI}38;5;${n}m`,
+  moveTo: (row, col) => `${CSI}${row};${col}H`,
+};
+
+// Color palette (ANSI palette for theme compatibility)
+const colors = {
+  bg: CSI + '49m',            // default background
+  title: CSI + '91m',         // bright red (coral)
+  label: CSI + '39m',         // default foreground
+  value: CSI + '39m',         // default foreground
+  dim: CSI + '2m',            // SGR dim
+  green: CSI + '32m',         // green
+  yellow: CSI + '33m',        // yellow
+  red: CSI + '31m',           // red
+  cyan: CSI + '36m',          // cyan
+  orange: CSI + '33m',        // yellow
+  border: CSI + '2m',         // SGR dim
+  separator: CSI + '2m',      // SGR dim
+  // Extra usage 4-tier color ramp
+  extraCool: CSI + '36m',     // cyan (< 50%)
+  extraWarm: CSI + '33m',     // yellow (50-75%)
+  extraHot: CSI + '31m',      // red (75-90%)
+  extraCritical: CSI + '91m', // bright red (>= 90%)
+};
+
+// Heatmap color palette (orange gradient)
+const heatmapColors = {
+  empty: ansi.fg(68, 68, 68),
+  level1: ansi.fg(196, 160, 0),
+  level2: ansi.fg(218, 140, 0),
+  level3: ansi.fg(240, 100, 0),
+  level4: ansi.fg(255, 60, 0),
+  future: ansi.fg(38, 38, 38),
+};
+
+function colorForPercent(pct) {
+  if (pct <= 50) return colors.green;
+  if (pct <= 80) return colors.yellow;
+  return colors.red;
+}
+
+function colorForExtraUsage(utilization) {
+  if (utilization < 0.50) return colors.extraCool;
+  if (utilization < 0.75) return colors.extraWarm;
+  if (utilization < 0.90) return colors.extraHot;
+  return colors.extraCritical;
+}
+
+function formatCents(cents) {
+  const absCents = Math.abs(Math.round(cents));
+  const dollars = Math.floor(absCents / 100);
+  const remainder = absCents % 100;
+  const prefix = cents < 0 ? '-' : '';
+  return `${prefix}$${dollars}.${String(remainder).padStart(2, '0')}`;
+}
+
+function extraUsageProgressBar(utilization, width = 20) {
+  const pct = Math.min(utilization, 1.0);
+  const filled = Math.round(pct * width);
+  const empty = width - filled;
+  const color = colorForExtraUsage(utilization);
+  return color + '\u2588'.repeat(filled) + colors.dim + '\u2591'.repeat(empty) + ansi.reset;
+}
+
+// ============================================================
+// Heatmap Data Layer
+// ============================================================
+
+function toLocalDateStr(date) {
+  const d = new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function loadStatsCache() {
+  try {
+    const home = (await hecaton.env.get_home()).path;
+    const cachePath = joinPath(home, '.claude', 'stats-cache.json');
+    const result = await hecaton.fs.read_file({ path: cachePath });
+    if (!result.ok) return null;
+    return JSON.parse(result.content);
+  } catch {
+    return null;
+  }
+}
+
+async function scanRecentActivity(afterDate) {
+  const activity = new Map();
+  const home = (await hecaton.env.get_home()).path;
+  const projectsDir = joinPath(home, '.claude', 'projects');
+  const statResult = await hecaton.fs.stat({ path: projectsDir });
+  if (!statResult.ok || !statResult.exists) return activity;
+  const cutoff = afterDate ? new Date(afterDate).getTime() : 0;
+
+  async function scanDir(dir) {
+    try {
+      const dirResult = await hecaton.fs.read_dir({ path: dir });
+      if (!dirResult.ok) return;
+      for (const entry of dirResult.entries) {
+        const fullPath = joinPath(dir, entry.name);
+        if (entry.is_dir) {
+          await scanDir(fullPath);
+        } else if (entry.name.endsWith('.jsonl')) {
+          try {
+            const st = await hecaton.fs.stat({ path: fullPath });
+            if (st.ok && st.mtime_ms > cutoff) {
+              const dateStr = toLocalDateStr(new Date(st.mtime_ms));
+              activity.set(dateStr, (activity.get(dateStr) || 0) + 1);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  await scanDir(projectsDir);
+  return activity;
+}
+
+function buildDailyActivityMap(cache, recentScans) {
+  const map = new Map();
+  if (cache && cache.dailyActivity) {
+    for (const entry of cache.dailyActivity) {
+      map.set(entry.date, (map.get(entry.date) || 0) + entry.sessionCount);
+    }
+  }
+  for (const [date, count] of recentScans) {
+    if (!map.has(date)) map.set(date, count);
+  }
+  return map;
+}
+
+function calculateThresholds(activityMap) {
+  const values = [...activityMap.values()].filter(v => v > 0).sort((a, b) => a - b);
+  if (values.length === 0) return [1, 2, 3, 4];
+  const p25 = values[Math.floor(values.length * 0.25)] || 1;
+  const p50 = values[Math.floor(values.length * 0.50)] || 2;
+  const p75 = values[Math.floor(values.length * 0.75)] || 3;
+  const pMax = values[values.length - 1] || 4;
+  return [Math.max(1, p25), Math.max(p25 + 1, p50), Math.max(p50 + 1, p75), Math.max(p75 + 1, pMax)];
+}
+
+function getActivityLevel(count, thresholds) {
+  if (!count || count <= 0) return 0;
+  if (count <= thresholds[0]) return 1;
+  if (count <= thresholds[1]) return 2;
+  if (count <= thresholds[2]) return 3;
+  return 4;
+}
+
+function calculateStreaks(activityMap) {
+  const today = toLocalDateStr(new Date());
+  let currentStreak = 0;
+  let longestStreak = 0;
+  let tempStreak = 0;
+  const dates = [...activityMap.keys()].sort();
+
+  for (let i = 0; i < dates.length; i++) {
+    if (i === 0) { tempStreak = 1; }
+    else {
+      const diffDays = Math.round((new Date(dates[i]) - new Date(dates[i - 1])) / 86400000);
+      tempStreak = diffDays === 1 ? tempStreak + 1 : 1;
+    }
+    longestStreak = Math.max(longestStreak, tempStreak);
+  }
+
+  const d = new Date();
+  if (activityMap.has(today)) {
+    currentStreak = 1;
+    const check = new Date(d);
+    while (true) {
+      check.setDate(check.getDate() - 1);
+      if (activityMap.has(toLocalDateStr(check))) currentStreak++;
+      else break;
+    }
+  } else {
+    const yesterday = new Date(d);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (activityMap.has(toLocalDateStr(yesterday))) {
+      currentStreak = 1;
+      const check = new Date(yesterday);
+      while (true) {
+        check.setDate(check.getDate() - 1);
+        if (activityMap.has(toLocalDateStr(check))) currentStreak++;
+        else break;
+      }
+    }
+  }
+
+  return { currentStreak, longestStreak };
+}
+
+function buildCalendarGrid(activityMap, thresholds) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayStr = toLocalDateStr(today);
+  const todayDow = today.getDay(); // 0=Sun
+  const todayRow = (todayDow + 6) % 7; // 0=Mon, 6=Sun
+
+  const numWeeks = 52;
+  const currentMonday = new Date(today);
+  currentMonday.setDate(currentMonday.getDate() - todayRow);
+  const firstMonday = new Date(currentMonday);
+  firstMonday.setDate(firstMonday.getDate() - (numWeeks - 1) * 7);
+
+  const grid = Array.from({ length: 7 }, () => []);
+  const monthLabels = [];
+  let lastMonth = -1;
+
+  for (let week = 0; week < numWeeks; week++) {
+    for (let row = 0; row < 7; row++) {
+      const d = new Date(firstMonday);
+      d.setDate(d.getDate() + week * 7 + row);
+      const dateStr = toLocalDateStr(d);
+      const isFuture = d > today;
+      const count = activityMap.get(dateStr) || 0;
+      const level = isFuture ? -1 : getActivityLevel(count, thresholds);
+      grid[row][week] = { date: dateStr, level, count, isFuture, isToday: dateStr === todayStr };
+      if (row === 0) {
+        const month = d.getMonth();
+        if (month !== lastMonth) {
+          monthLabels.push({ col: week, label: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][month] });
+          lastMonth = month;
+        }
+      }
+    }
+  }
+
+  return { grid, monthLabels, numWeeks };
+}
+
+async function loadHeatmapData() {
+  const cache = await loadStatsCache();
+  const afterDate = cache?.lastComputedDate || null;
+  const recentScans = await scanRecentActivity(afterDate);
+  const activityMap = buildDailyActivityMap(cache, recentScans);
+  const thresholds = calculateThresholds(activityMap);
+  const streaks = calculateStreaks(activityMap);
+  const { grid, monthLabels, numWeeks } = buildCalendarGrid(activityMap, thresholds);
+  const totalDays = [...activityMap.keys()].length;
+  const totalSessions = [...activityMap.values()].reduce((a, b) => a + b, 0);
+  return { grid, monthLabels, numWeeks, thresholds, streaks, totalDays, totalSessions };
+}
+
+// ============================================================
+// Credentials & API
+// ============================================================
+let credentialsCache = null;
+
+async function getCredentials() {
+  try {
+    const platform = await hecaton.sys.get_platform();
+    if (platform.os === 'macos') {
+      return await getCredentialsFromKeychain();
+    }
+    return await getCredentialsFromFile();
+  } catch {
+    return null;
+  }
+}
+
+async function getCredentialsFromKeychain() {
+  try {
+    const result = await hecaton.process.exec({
+      program: 'security',
+      args: ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+      timeout_ms: 5000,
+    });
+    if (!result.ok) return await getCredentialsFromFile();
+    const creds = JSON.parse(result.stdout.trim());
+    return creds?.claudeAiOauth?.accessToken ?? null;
+  } catch {
+    return await getCredentialsFromFile();
+  }
+}
+
+async function getCredentialsFromFile() {
+  try {
+    const homeResult = await hecaton.env.get_home();
+    const home = homeResult ? homeResult.path : null;
+    if (!home) {
+      process.stderr.write('[claude-dashboard] env.get_home failed: ' + JSON.stringify(homeResult) + '\n');
+      return null;
+    }
+    const credPath = joinPath(home, '.claude', '.credentials.json');
+    process.stderr.write('[claude-dashboard] Reading credentials from: ' + credPath + '\n');
+    const result = await hecaton.fs.read_file({ path: credPath });
+    process.stderr.write('[claude-dashboard] fs.read_file result: ok=' + result.ok + ' error=' + (result.error || 'none') + '\n');
+    if (!result.ok) return null;
+    const creds = JSON.parse(result.content);
+    return creds?.claudeAiOauth?.accessToken ?? null;
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] getCredentialsFromFile error: ' + (e.message || e) + '\n');
+    return null;
+  }
+}
+
+let autoRefreshMs = 300000; // 5 minutes default
+const CLAUDE_STATUS_URL = 'https://status.claude.com/api/v2/summary.json';
+const MINIMIZED_OUTAGE_LABEL = 'DOWN';
+const STATUS_REFRESH_NORMAL_MS = 300000; // 5 minutes
+const STATUS_REFRESH_OUTAGE_MS = 30000;  // 30 seconds
+
+const PLUGIN_DIR_NAME = (function() {
+  // Extract directory name from __dirname
+  const parts = __dirname.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || 'hecaton-plugin-claude-dashboard';
+})();
+const CACHE_DIR = joinPath((await hecaton.env.get_home()).path, '.hecaton', 'data', PLUGIN_DIR_NAME);
+const CACHE_FILE = joinPath(CACHE_DIR, 'cache.json');
+
+async function loadCache() {
+  try {
+    const result = await hecaton.fs.read_file({ path: CACHE_FILE });
+    if (!result.ok) return null;
+    return JSON.parse(result.content);
+  } catch {
+    return null;
+  }
+}
+
+async function saveCache(data) {
+  try {
+    await hecaton.fs.mkdir({ path: CACHE_DIR, recursive: true });
+    await hecaton.fs.write_file({ path: CACHE_FILE, content: JSON.stringify({ ...data, _cachedAt: Date.now() }) });
+  } catch { /* ignore write errors */ }
+}
+
+async function fetchUsageLimits(token) {
+  try {
+    const resp = await hecaton.http.get({
+      url: 'https://api.anthropic.com/api/oauth/usage',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'hecaton-claude-dashboard/1.0',
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+      timeout_sec: 5,
+    });
+
+    if (!resp.ok) {
+      return { _error: { key: 'Network error: {error}', args: { error: resp.error || tr('Request failed') } } };
+    }
+
+    if (resp.status === 429) {
+      autoRefreshMs = Math.min(autoRefreshMs * 2, 1800000);
+      return { _error: { key: 'API rate limited (429). Retrying in {minutes}min...', args: { minutes: Math.round(autoRefreshMs / 60000) } } };
+    }
+    if (resp.status === 401) {
+      return { _error: 'Token expired or invalid (401). Re-login to Claude Code.' };
+    }
+    if (resp.status !== 200) {
+      return { _error: { key: 'API error (HTTP {status})', args: { status: resp.status } } };
+    }
+
+    // Successful response: reset interval to default
+    autoRefreshMs = 300000;
+    const data = JSON.parse(resp.body);
+    return {
+      five_hour: data.five_hour ?? null,
+      seven_day: data.seven_day ?? null,
+      seven_day_sonnet: data.seven_day_sonnet ?? null,
+      limits: Array.isArray(data.limits) ? data.limits : [],
+      extra_usage: data.extra_usage ?? null,
+    };
+  } catch (e) {
+    return { _error: { key: 'Network error: {error}', args: { error: e.message || tr('unknown') } } };
+  }
+}
+
+async function fetchClaudeStatus() {
+  try {
+    const resp = await hecaton.http.get({
+      url: CLAUDE_STATUS_URL,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'hecaton-claude-dashboard/1.0',
+      },
+      timeout_sec: 5,
+    });
+
+    if (!resp.ok) {
+      return { _error: 'Status check failed: ' + (resp.error || 'Request failed') };
+    }
+    if (resp.status !== 200) {
+      return { _error: `Status check failed (HTTP ${resp.status})` };
+    }
+
+    const data = JSON.parse(resp.body);
+    const validIndicators = new Set(['none', 'minor', 'major', 'critical']);
+    const rawIndicator = data?.status?.indicator;
+    const indicator = validIndicators.has(rawIndicator) ? rawIndicator : 'unknown';
+    const components = Array.isArray(data?.components) ? data.components : [];
+    const incidents = Array.isArray(data?.incidents) ? data.incidents : [];
+    const affectedComponents = components
+      .filter(component => component?.status && component.status !== 'operational')
+      .map(component => ({
+        name: component.name || 'Unknown component',
+        status: component.status,
+      }));
+
+    return {
+      indicator,
+      description: data?.status?.description || 'Status unavailable',
+      hasIssue:
+        (indicator !== 'none' && indicator !== 'unknown') ||
+        affectedComponents.length > 0 ||
+        incidents.length > 0,
+      affectedComponents,
+      incidentName: incidents[0]?.name || null,
+      checkedAt: Date.now(),
+    };
+  } catch (e) {
+    return { _error: 'Status check failed: ' + (e.message || 'unknown') };
+  }
+}
+
+async function sendServiceRecoveryNotification() {
+  try {
+    await hecaton.notify.send({
+      title: tr('Claude Service Restored'),
+      body: tr('Claude services are operational again.'),
+    });
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] Recovery notification failed: ' + (e.message || e) + '\n');
+  }
+}
+
+async function requestNotificationPermissionOnStartup() {
+  try {
+    const current = await hecaton.permissions.query({
+      permission: 'notification',
+    });
+
+    if (current.state !== 'prompt') return current;
+
+    return await hecaton.permissions.request({
+      permission: 'notification',
+    });
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] Notification permission preflight failed: ' + (e.message || e) + '\n');
+    return { granted: false, state: 'unavailable' };
+  }
+}
+
+function applyServiceStatusResult(state, serviceStatus) {
+  const wasDown = state.lastKnownServiceIssue === true;
+  state.serviceStatus = serviceStatus;
+
+  if (serviceStatus._error) return false;
+
+  state.lastKnownServiceIssue = serviceStatus.hasIssue;
+  return wasDown && !serviceStatus.hasIssue;
+}
+
+// ============================================================
+// Config & Settings
+// ============================================================
+
+async function loadConfig() {
+  try {
+    const home = (await hecaton.env.get_home()).path;
+    const configPath = joinPath(home, '.claude', 'claude-dashboard.local.json');
+    const result = await hecaton.fs.read_file({ path: configPath });
+    if (!result.ok) return { plan: 'max', displayMode: 'detailed', language: 'auto' };
+    return { plan: 'max', displayMode: 'detailed', ...JSON.parse(result.content) };
+  } catch {
+    return { plan: 'max', displayMode: 'detailed', language: 'auto' };
+  }
+}
+
+async function getEffortLevel() {
+  try {
+    const home = (await hecaton.env.get_home()).path;
+    const settingsPath = joinPath(home, '.claude', 'settings.json');
+    const result = await hecaton.fs.read_file({ path: settingsPath });
+    if (!result.ok) return 'high';
+    const settings = JSON.parse(result.content);
+    return settings?.effortLevel ?? 'high';
+  } catch {
+    return 'high';
+  }
+}
+
+// ============================================================
+// Progress Bar
+// ============================================================
+
+function progressBar(percent, width = 20) {
+  const filled = Math.round((percent / 100) * width);
+  const empty = width - filled;
+  const color = colorForPercent(percent);
+  const bar = color + '\u2588'.repeat(filled) + colors.dim + '\u2591'.repeat(empty) + ansi.reset;
+  return bar;
+}
+
+function formatPercent(pct) {
+  const color = colorForPercent(pct);
+  return color + pct.toFixed(0) + '%' + ansi.reset;
+}
+
+function formatTokens(tokens) {
+  if (tokens >= 1e6) return (tokens / 1e6).toFixed(1) + 'M';
+  if (tokens >= 1e3) return (tokens / 1e3).toFixed(0) + 'K';
+  return tokens.toString();
+}
+
+function formatDuration(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  if (days > 0) return tr('{count}d', { count: days }) + (hours > 0 ? tr('{count}h', { count: hours }) : '');
+  if (hours > 0) return tr('{count}h', { count: hours }) + (minutes > 0 ? tr('{count}m', { count: minutes }) : '');
+  return tr('{count}m', { count: minutes });
+}
+
+function formatResetTime(resetAt) {
+  if (!resetAt) return '';
+  try {
+    const resetMs = new Date(resetAt).getTime();
+    const remainMs = resetMs - Date.now();
+    if (remainMs <= 0) return tr('now');
+    return formatDuration(remainMs);
+  } catch {
+    return '';
+  }
+}
+
+// Exact local wall-clock time: 2026-07-26 14:30
+function formatExactTime(timestamp) {
+  if (!timestamp) return null;
+  try {
+    const d = new Date(timestamp);
+    if (Number.isNaN(d.getTime())) return null;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch {
+    return null;
+  }
+}
+
+// Full remaining duration without truncation: 2d 3h 20m
+function formatDurationLong(ms) {
+  const totalMin = Math.floor(ms / 60000);
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const minutes = totalMin % 60;
+  const parts = [];
+  if (days > 0) parts.push(tr('{count}d', { count: days }));
+  if (hours > 0) parts.push(tr('{count}h', { count: hours }));
+  parts.push(tr('{count}m', { count: minutes }));
+  return parts.join(' ');
+}
+
+function buildResetTooltip(label, resetAt) {
+  const exact = formatExactTime(resetAt);
+  if (!exact) return null;
+  const remainMs = new Date(resetAt).getTime() - Date.now();
+  const remaining = remainMs > 0 ? formatDurationLong(remainMs) : tr('now');
+  return tr('{label}\nResets: {exact}\nRemaining: {remaining}', { label, exact, remaining });
+}
+
+function getFableLimit(data) {
+  if (!Array.isArray(data?.limits)) return null;
+
+  const limit = data.limits.find((item) => {
+    const displayName = item?.scope?.model?.display_name;
+    return item?.kind === 'weekly_scoped' &&
+      typeof displayName === 'string' &&
+      displayName.trim().toLowerCase() === 'fable';
+  });
+  if (!limit) return null;
+
+  const utilization = Number(limit.percent);
+  if (!Number.isFinite(utilization)) return null;
+
+  return {
+    utilization,
+    resets_at: limit.resets_at ?? null,
+  };
+}
+
+// ============================================================
+// Rendering
+// ============================================================
+
+// Dynamic terminal size (updated by host resize notifications)
+let termCols = parseInt((await hecaton.env.get({ name: 'HECA_COLS' })).value || '80', 10);
+let termRows = parseInt((await hecaton.env.get({ name: 'HECA_ROWS' })).value || '24', 10);
+let clickableAreas = [];
+let hoveredAreaIndex = -1;
+let currentButtons = [];
+let navigationAreas = [];
+
+function renderNavigation(state) {
+  if (state.minimized) return;
+  const active = state.agentView ? 1 : state.heatmapView ? 2 : 0;
+  const labels = ['nav.dashboard', 'nav.agents', 'nav.activity'];
+  const slot = Math.max(1, Math.floor(termCols / 3));
+  navigationAreas = [];
+  let line = '';
+  for (let i = 0; i < 3; i++) {
+    const width = i === 2 ? termCols - slot * 2 : slot;
+    const label = clipCells(`[${i + 1}] ${tr(labels[i])}`, width);
+    line += (i === active ? colors.title + ansi.bold + '\x1b[7m' : colors.dim) + padCells(label, width) + ansi.reset;
+    navigationAreas.push({ colStart: i * slot + 1, colEnd: i * slot + width, view: i });
+  }
+  process.stdout.write(ansi.moveTo(1, 1) + line + ansi.reset);
+  if (termRows >= 2) process.stdout.write(ansi.moveTo(2, 1) + colors.separator + '\u2500'.repeat(termCols) + ansi.reset);
+}
+
+function renderPage(lines, buttonLineIdx, state) {
+  const height = Math.max(0, termRows - 2);
+  state.maxContentScroll = Math.max(0, lines.length - height);
+  state.contentScroll = Math.min(state.contentScroll || 0, state.maxContentScroll);
+  process.stdout.write(ansi.clear + ansi.hideCursor);
+  for (let i = 0; i < height; i++) {
+    const line = lines[i + state.contentScroll] || '';
+    process.stdout.write(ansi.moveTo(i + 3, 1) + clipCells(line, termCols) + ansi.reset);
+  }
+  clickableAreas = [];
+  const screenRow = buttonLineIdx - state.contentScroll + 3;
+  if (buttonLineIdx >= 0 && screenRow >= 3 && screenRow <= termRows) {
+    const plain = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
+    for (const button of currentButtons) {
+      const idx = plain.indexOf(button.label);
+      if (idx < 0) continue;
+      const start = displayWidth(plain.slice(0, idx)) + 1;
+      if (start <= termCols) clickableAreas.push({ row: screenRow, colStart: start,
+        colEnd: Math.min(termCols, start + displayWidth(button.label) - 1), action: button.action });
+    }
+  }
+  renderNavigation(state);
+}
+// Hover areas of the minimized bar: { colStart, colEnd, label, resetAt } (1-based cols)
+let minimizedTooltipAreas = [];
+let lastTooltipText = null;
+
+function setTooltip(text) {
+  if (text === lastTooltipText) return;
+  lastTooltipText = text;
+  try {
+    hecaton.window.set_tooltip({ text }).catch(() => {});
+  } catch { /* host without tooltip support */ }
+}
+
+// Mouse coords are 1-based; the minimized bar is drawn on row 1.
+function updateMinimizedTooltip(cx, cy) {
+  let text = '';
+  if (cy === 1) {
+    for (const area of minimizedTooltipAreas) {
+      if (cx >= area.colStart && cx <= area.colEnd) {
+        // Built on hover so the remaining time never goes stale between renders
+        text = buildResetTooltip(area.label, area.resetAt) || '';
+        break;
+      }
+    }
+  }
+  setTooltip(text);
+}
+
+function buildHintText(buttons) {
+  let result = '';
+  for (let i = 0; i < buttons.length; i++) {
+    if (i > 0) result += '  ';
+    const color = (i === hoveredAreaIndex) ? colors.value + ansi.bold : colors.dim;
+    result += color + buttons[i].label + ansi.reset;
+  }
+  return result;
+}
+
+function getTermSize() {
+  return { cols: termCols, rows: termRows };
+}
+
+function centerText(text, width) {
+  // Strip ANSI for length calculation
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
+  const pad = Math.max(0, Math.floor((width - displayWidth(plain)) / 2));
+  return ' '.repeat(pad) + text;
+}
+
+function padRight(text, width) {
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
+  const pad = Math.max(0, width - displayWidth(plain));
+  return text + ' '.repeat(pad);
+}
+
+function truncate(text, maxLen) {
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, '');
+  if (displayWidth(plain) <= maxLen) return text;
+  // Simple truncation (works for non-ANSI parts)
+  return clipCells(text, maxLen - 3) + '...';
+}
+
+function colorForServiceIndicator(indicator) {
+  if (indicator === 'critical' || indicator === 'major') return colors.red;
+  if (indicator === 'minor') return colors.yellow;
+  if (indicator === 'none') return colors.green;
+  return colors.dim;
+}
+
+function appendServiceStatusMessage(lines, state, width) {
+  const status = state.serviceStatus;
+  const maxTextWidth = Math.max(12, width - 4);
+
+  if (!status) {
+    lines.push(centerText(colors.dim + tr('Claude Status: Checking...') + ansi.reset, width));
+    return;
+  }
+  if (status._error) {
+    lines.push(centerText(colors.yellow + tr('Claude Status: Unavailable') + ansi.reset, width));
+    return;
+  }
+
+  const statusColor = colorForServiceIndicator(status.indicator);
+  const statusText = truncate(tr('Claude Status: ') + tr(status.description), maxTextWidth);
+  lines.push(centerText(statusColor + ansi.bold + statusText + ansi.reset, width));
+
+  if (status.hasIssue) {
+    const details = [];
+    if (status.incidentName) details.push(status.incidentName);
+    if (status.affectedComponents.length > 0) {
+      details.push(tr('Affected: ') + status.affectedComponents.map(component => component.name).join(', '));
+    }
+    if (details.length > 0) {
+      lines.push(centerText(colors.dim + truncate(details.join(' | '), maxTextWidth) + ansi.reset, width));
+    }
+  }
+}
+
+function drawBox(lines, width) {
+  const topBorder = colors.border + '\u250c' + '\u2500'.repeat(width - 2) + '\u2510' + ansi.reset;
+  const botBorder = colors.border + '\u2514' + '\u2500'.repeat(width - 2) + '\u2518' + ansi.reset;
+  const result = [topBorder];
+  for (const line of lines) {
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+    const pad = Math.max(0, width - 2 - displayWidth(plain));
+    result.push(colors.border + '\u2502' + ansi.reset + ' ' + line + ' '.repeat(pad > 0 ? pad - 1 : 0) + colors.border + '\u2502' + ansi.reset);
+  }
+  result.push(botBorder);
+  return result;
+}
+
+function drawSeparator(width) {
+  return colors.separator + '\u2500'.repeat(width - 2) + ansi.reset;
+}
+
+// \ud45c\uc2dc \ud3ed \uae30\uc900\uc73c\ub85c \uc790\ub974\ub418 SGR \uc2dc\ud000\uc2a4\ub294 \ud3ed\uc5d0 \uc138\uc9c0 \uc54a\ub294\ub2e4.
+// \ucd5c\uc18c\ud654 \ubc14\ub294 \ud638\uc2a4\ud2b8 \ubc84\ud37c\uac00 1\ud589\uc774\ub77c, \ud3ed\uc744 \ud55c \uce78\uc774\ub77c\ub3c4 \ub118\uae30\uba74 \uc624\ud1a0\ub7a9\uc774 \uc2a4\ud06c\ub864\uc744
+// \uc77c\uc73c\ucf1c \ubc29\uae08 \uadf8\ub9b0 \uc904\uc774 \ud1b5\uc9f8\ub85c \uc0ac\ub77c\uc9c4\ub2e4(= \ub77c\ubca8\ub9cc \ub0a8\uace0 \ube48 \ubc14). \ub118\uce60 \ub9cc\ud55c \ubb38\uc790\uc5f4\uc740
+// \ubc18\ub4dc\uc2dc \uc5ec\uae30\ub97c \ud1b5\uacfc\uc2dc\ud0ac \uac83.
+function truncateAnsi(text, maxCols) {
+  return clipCells(text, maxCols);
+}
+
+function renderMinimized(state) {
+  const { cols } = getTermSize();
+  const data = state.data;
+  let line = '';
+
+  // The minimized bar has no buttons; drop areas left over from the full view
+  clickableAreas = [];
+  minimizedTooltipAreas = [];
+
+  const plainLength = () => displayWidth(line);
+  const addTooltipArea = (startIdx, label, resetAt) => {
+    if (!resetAt) return;
+    const endIdx = plainLength();
+    if (endIdx > startIdx) {
+      minimizedTooltipAreas.push({ colStart: startIdx + 1, colEnd: endIdx, label, resetAt });
+    }
+  };
+
+  const serviceStatus = state.serviceStatus;
+  const serviceIsDown = serviceStatus && !serviceStatus._error
+    ? serviceStatus.hasIssue
+    : state.lastKnownServiceIssue === true;
+  if (serviceIsDown) {
+    const statusColor = serviceStatus && !serviceStatus._error
+      ? colorForServiceIndicator(serviceStatus.indicator)
+      : colors.red;
+    line += statusColor + ansi.bold + tr(MINIMIZED_OUTAGE_LABEL) + ansi.reset;
+  }
+
+  if (data) {
+    const fable = getFableLimit(data);
+
+    if (data.five_hour) {
+      const pct = Math.round(data.five_hour.utilization);
+      const reset = formatResetTime(data.five_hour.resets_at);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
+      const segStart = plainLength();
+      line += colors.label + (reset || '5h') + ': ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, tr('5-hour limit'), data.five_hour.resets_at);
+    }
+    if (data.seven_day) {
+      const pct = Math.round(data.seven_day.utilization);
+      const reset = formatResetTime(data.seven_day.resets_at);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
+      const segStart = plainLength();
+      line += colors.label + (reset || '7d') + ': ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, tr('7-day limit'), data.seven_day.resets_at);
+    }
+    if (fable) {
+      const pct = Math.round(fable.utilization);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
+      const segStart = plainLength();
+      line += colors.label + 'Fable: ' + ansi.reset;
+      line += formatPercent(pct) + ' ' + progressBar(pct, 10);
+      addTooltipArea(segStart, tr('Fable weekly limit'), fable.resets_at);
+    }
+
+    // Extra usage in minimized mode
+    if (data.extra_usage && data.extra_usage.is_enabled) {
+      const eu = data.extra_usage;
+      const usedCents = eu.used_credits != null ? Math.round(eu.used_credits) : 0;
+      const limitCents = eu.monthly_limit != null ? Math.round(eu.monthly_limit) : null;
+      const utilization = eu.utilization != null ? eu.utilization / 100 : 0;
+      const pctDisplay = Math.round(utilization * 100);
+      const usageColor = colorForExtraUsage(utilization);
+      if (line) line += colors.dim + ' | ' + ansi.reset;
+      const label = limitCents != null && limitCents > 0
+        ? formatCents(limitCents - usedCents)
+        : formatCents(usedCents);
+      line += colors.label + label + ': ' + ansi.reset;
+      line += usageColor + pctDisplay + '%' + ansi.reset + ' ';
+      line += extraUsageProgressBar(utilization, 10);
+    }
+  }
+
+  // \uadf8\ub9b4 \uac8c \uc5c6\uc73c\uba74 \uc0c1\ud0dc\ub97c \uc801\ub294\ub2e4. \ube48 \ubc14\ub294 "\ud50c\ub7ec\uadf8\uc778\uc774 \uc8fd\uc5c8\ub098?"\ub85c \uc77d\ud788\uace0,
+  // \uc2e4\uc81c\ub85c \ub85c\ub529\uc740 \uc790\uaca9\uc99d\uba85 \uc870\ud68c + \ub124\ud2b8\uc6cc\ud06c\ub77c \uc218 \ucd08 \uc774\uc0c1 \uac78\ub9b0\ub2e4.
+  // \u26a0\ufe0f \uc870\uac74\uc774 `!data` \ub9cc\uc774\uba74 \uc548 \ub41c\ub2e4 \u2014 \uc751\ub2f5\uc740 \uc654\ub294\ub370 \ud55c\ub3c4 \ud56d\ubaa9\uc774 \ud558\ub098\ub3c4 \uc5c6\uc73c\uba74
+  //    data \ub294 truthy \uc778\ub370 \uc904\uc740 \uadf8\ub300\ub85c \ube44\uc5b4 \uc788\ub2e4. "\uc904\uc774 \ube44\uc5c8\ub294\uac00"\ub3c4 \ud568\uaed8 \ubcf8\ub2e4.
+  if (!data || plainLength() === 0) {
+    if (line) line += colors.dim + ' | ' + ansi.reset;
+    if (state.error) {
+      line += colors.red + messageText(state.error) + ansi.reset;
+    } else if (state.loading) {
+      line += colors.dim + tr('Loading...') + ansi.reset;
+    } else {
+      line += colors.dim + tr('No data') + ansi.reset;
+    }
+  }
+
+  if (state.lastRefresh) {
+    const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
+    const cacheTag = (state.data && state.data._fromCache) ? tr(' (cached)') : '';
+    line += colors.dim + ' | ' + ansi.reset;
+    line += colors.dim + '\u21bb ' + ago + 's' + cacheTag + ansi.reset;
+  }
+
+  // Pad/truncate to terminal width
+  // \u26a0\ufe0f \uc790\ub974\uae30\uac00 \ube60\uc9c0\uba74 \uc548 \ub41c\ub2e4 \u2014 \ud3ed\uc744 \ub118\uae34 \uc904\uc740 1\ud589 \ubc84\ud37c\uc5d0\uc11c \uc2a4\ud06c\ub864\ub418\uc5b4 \ud1b5\uc9f8\ub85c \uc0ac\ub77c\uc9c4\ub2e4.
+  let plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  if (displayWidth(plain) > cols) {
+    line = truncateAnsi(line, cols);
+    plain = line.replace(/\x1b\[[0-9;]*m/g, '');
+  }
+  const pad = Math.max(0, cols - displayWidth(plain));
+  line += ' '.repeat(pad);
+
+  process.stdout.write(ansi.clear + ansi.hideCursor);
+  process.stdout.write(ansi.moveTo(1, 1) + line + ansi.reset);
+}
+
+function render(state) {
+  const { cols, rows } = getTermSize();
+  const width = Math.max(4, cols);
+  const lines = [];
+  let buttonLineIdx = -1;
+  currentButtons = [];
+
+  // Title
+  lines.push('');
+  lines.push(centerText(
+    colors.title + ansi.bold + tr(' Claude Dashboard ') + ansi.reset +
+    colors.dim + 'v' + PLUGIN_VERSION + ansi.reset,
+    width
+  ));
+  lines.push('');
+
+  appendServiceStatusMessage(lines, state, width);
+  lines.push('');
+
+  if (state.error) {
+    lines.push(centerText(colors.red + messageText(state.error) + ansi.reset, width));
+    lines.push('');
+    currentButtons = [{ label: tr('[r] Refresh'), action: 'refresh' }];
+    buttonLineIdx = lines.length;
+    lines.push(centerText(buildHintText(currentButtons), width));
+  } else if (state.loading) {
+    lines.push(centerText(colors.dim + tr('Loading...') + ansi.reset, width));
+    currentButtons = [];
+    buttonLineIdx = lines.length;
+    lines.push(centerText(buildHintText(currentButtons), width));
+  } else {
+    const data = state.data;
+
+    // -- Plan & Effort --
+    const effortMap = { high: 'H', medium: 'M', low: 'L' };
+    const effortLabel = effortMap[state.effort] || 'H';
+    const planLabel = state.config.plan === 'max' ? 'Max' : 'Pro';
+    lines.push(
+      '  ' + colors.label + tr('Plan: ') + ansi.reset +
+      colors.value + ansi.bold + planLabel + ansi.reset +
+      (state.effort !== 'high' ? colors.dim + tr('  Effort: ') + ansi.reset + colors.value + effortLabel + ansi.reset : '')
+    );
+    lines.push('');
+
+    // -- Rate Limits --
+    lines.push('  ' + colors.title + ansi.bold + tr('Rate Limits') + ansi.reset);
+    lines.push('  ' + drawSeparator(width - 3));
+
+    if (data && !data._error) {
+      const fable = getFableLimit(data);
+
+      // 5-hour
+      if (data.five_hour) {
+        const pct = Math.round(data.five_hour.utilization);
+        const reset = formatResetTime(data.five_hour.resets_at);
+        lines.push(
+          '  ' + colors.label + '5h    ' + ansi.reset +
+          progressBar(pct, 25) + '  ' + formatPercent(pct) +
+          (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
+        );
+      }
+
+      // 7-day
+      if (data.seven_day) {
+        const pct = Math.round(data.seven_day.utilization);
+        const reset = formatResetTime(data.seven_day.resets_at);
+        lines.push(
+          '  ' + colors.label + '7d    ' + ansi.reset +
+          progressBar(pct, 25) + '  ' + formatPercent(pct) +
+          (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
+        );
+      }
+
+      // 7-day Sonnet
+      if (data.seven_day_sonnet) {
+        const pct = Math.round(data.seven_day_sonnet.utilization);
+        const reset = formatResetTime(data.seven_day_sonnet.resets_at);
+        lines.push(
+          '  ' + colors.label + '7d-S  ' + ansi.reset +
+          progressBar(pct, 25) + '  ' + formatPercent(pct) +
+          (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
+        );
+      }
+
+      // 7-day Fable
+      if (fable) {
+        const pct = Math.round(fable.utilization);
+        const reset = formatResetTime(fable.resets_at);
+        lines.push(
+          '  ' + colors.label + 'Fable ' + ansi.reset +
+          progressBar(pct, 25) + '  ' + formatPercent(pct) +
+          (reset ? colors.dim + '  (' + reset + ')' + ansi.reset : '')
+        );
+      }
+
+      if (!data.five_hour && !data.seven_day && !data.seven_day_sonnet && !fable) {
+        lines.push('  ' + colors.dim + tr('No rate limit data available') + ansi.reset);
+      }
+
+      // -- Extra Usage --
+      if (data.extra_usage && data.extra_usage.is_enabled) {
+        lines.push('');
+        lines.push('  ' + colors.title + ansi.bold + tr('Extra Usage') + ansi.reset);
+        lines.push('  ' + drawSeparator(width - 3));
+
+        const eu = data.extra_usage;
+        const usedCents = eu.used_credits != null ? Math.round(eu.used_credits) : 0;
+        const limitCents = eu.monthly_limit != null ? Math.round(eu.monthly_limit) : null;
+        // API returns utilization as percentage (e.g. 2.82 = 2.82%), convert to 0-1 fraction
+        const utilization = eu.utilization != null ? eu.utilization / 100 : 0;
+
+        if (usedCents > 0 || (limitCents != null && limitCents > 0)) {
+          const usageColor = colorForExtraUsage(utilization);
+          const pctDisplay = Math.round(utilization * 100);
+
+          // Currency + progress bar on one line: $1.41 / $50.00  ██░░░░░░░░░░░░  3%
+          let currencyText;
+          if (limitCents != null && limitCents > 0) {
+            currencyText = formatCents(usedCents) + ' / ' + formatCents(limitCents);
+          } else {
+            currencyText = formatCents(usedCents) + tr(' spent');
+          }
+          lines.push(
+            '  ' + usageColor + ansi.bold + currencyText + ansi.reset +
+            '  ' + extraUsageProgressBar(utilization, 15) + '  ' +
+            usageColor + pctDisplay + '%' + ansi.reset
+          );
+
+          // Remaining balance
+          if (limitCents != null && limitCents > 0) {
+            const remainingCents = limitCents - usedCents;
+            lines.push(
+              '  ' + colors.label + tr('Remaining: ') + ansi.reset +
+              colors.value + formatCents(remainingCents) + ansi.reset
+            );
+          }
+        } else {
+          lines.push('  ' + colors.dim + tr('Extra usage enabled, no spend this period') + ansi.reset);
+        }
+      }
+    } else if (data && data._error) {
+      lines.push('  ' + colors.yellow + messageText(data._error) + ansi.reset);
+    } else {
+      lines.push('  ' + colors.yellow + tr('Failed to fetch rate limits') + ansi.reset);
+      lines.push('  ' + colors.dim + tr('Check ~/.claude/.credentials.json') + ansi.reset);
+    }
+
+    lines.push('');
+
+    // -- Session Info --
+    lines.push('  ' + colors.title + ansi.bold + tr('Session') + ansi.reset);
+    lines.push('  ' + drawSeparator(width - 3));
+
+    const elapsed = Date.now() - state.startTime;
+    let sessionLine = '  ' + colors.label + tr('Uptime: ') + ansi.reset +
+      colors.value + formatDuration(elapsed) + ansi.reset;
+    if (state.lastRefresh) {
+      const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
+      const cacheTag = (state.data && state.data._fromCache) ? tr(' (cached)') : '';
+      sessionLine += colors.dim + '  |  ' + ansi.reset +
+        colors.label + tr('Updated: ') + ansi.reset +
+        colors.dim + ago + tr('s ago') + cacheTag + ansi.reset;
+    }
+    lines.push(sessionLine);
+
+    lines.push('');
+
+    // -- Keyboard --
+    lines.push('  ' + drawSeparator(width - 3));
+    currentButtons = [
+      { label: tr('[r] Refresh'), action: 'refresh' },
+    ];
+    buttonLineIdx = lines.length;
+    lines.push('  ' + buildHintText(currentButtons));
+  }
+
+  lines.push('');
+
+  renderPage(lines, buttonLineIdx, state);
+}
+
+function renderHeatmap(state) {
+  const { cols, rows } = getTermSize();
+  const width = Math.max(4, cols);
+  const lines = [];
+  let buttonLineIdx = -1;
+  currentButtons = [];
+
+  lines.push('');
+  lines.push(centerText(
+    colors.title + ansi.bold + tr(' Activity Heatmap ') + ansi.reset +
+    colors.dim + tr('(52 weeks)') + ansi.reset,
+    width
+  ));
+  lines.push('');
+
+  appendServiceStatusMessage(lines, state, width);
+  lines.push('');
+
+  if (state.heatmapLoading) {
+    lines.push(centerText(colors.dim + tr('Loading heatmap data...') + ansi.reset, width));
+  } else if (!state.heatmapData) {
+    lines.push(centerText(colors.dim + tr('No activity data available') + ansi.reset, width));
+  } else {
+    const hd = state.heatmapData;
+    const labelWidth = 4;
+    const visibleWeeks = Math.max(1, Math.min(hd.numWeeks, cols - labelWidth - 2));
+    const firstWeek = hd.numWeeks - visibleWeeks;
+    const dayLabels = [tr('Mon'), '', tr('Wed'), '', tr('Fri'), '', tr('Sun')];
+
+    // Month labels
+    let monthLine = '';
+    let lastEnd = -1;
+    for (const { col: originalCol, label } of hd.monthLabels) {
+      const col = originalCol - firstWeek;
+      if (col < 0) continue;
+      if (col > lastEnd) {
+        const translated = clipCells(tr(label), visibleWeeks - col);
+        monthLine = padCells(monthLine, col) + translated;
+        lastEnd = col + displayWidth(translated);
+      }
+    }
+    lines.push('  ' + ' '.repeat(labelWidth) + colors.dim + padCells(monthLine, visibleWeeks) + ansi.reset);
+
+    // Grid rows (Mon=0 to Sun=6)
+    for (let dow = 0; dow < 7; dow++) {
+      let line = '  ' + colors.dim + padCells(dayLabels[dow] || ' ', labelWidth) + ansi.reset;
+      for (let week = firstWeek; week < hd.numWeeks; week++) {
+        const cell = hd.grid[dow] && hd.grid[dow][week];
+        if (!cell) { line += ' '; continue; }
+        let color;
+        if (cell.isFuture) color = heatmapColors.future;
+        else switch (cell.level) {
+          case 1: color = heatmapColors.level1; break;
+          case 2: color = heatmapColors.level2; break;
+          case 3: color = heatmapColors.level3; break;
+          case 4: color = heatmapColors.level4; break;
+          default: color = heatmapColors.empty;
+        }
+        line += color + '\u2588' + ansi.reset;
+      }
+      lines.push(line);
+    }
+
+    lines.push('');
+
+    // Legend
+    let legend = '  ' + colors.dim + tr('Less ') + ansi.reset;
+    legend += heatmapColors.empty + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level1 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level2 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level3 + '\u2588' + ansi.reset + ' ';
+    legend += heatmapColors.level4 + '\u2588' + ansi.reset;
+    legend += colors.dim + tr(' More') + ansi.reset;
+    lines.push(legend);
+
+    lines.push('');
+
+    // Statistics
+    lines.push('  ' + colors.title + ansi.bold + tr('Statistics') + ansi.reset);
+    lines.push('  ' + drawSeparator(width - 3));
+    lines.push(
+      '  ' + colors.label + tr('Active days: ') + ansi.reset +
+      colors.value + ansi.bold + hd.totalDays + ansi.reset +
+      colors.dim + '  |  ' + ansi.reset +
+      colors.label + tr('Sessions: ') + ansi.reset +
+      colors.value + ansi.bold + hd.totalSessions + ansi.reset
+    );
+    lines.push(
+      '  ' + colors.label + tr('Current streak: ') + ansi.reset +
+      colors.value + ansi.bold + hd.streaks.currentStreak + tr(' days') + ansi.reset +
+      colors.dim + '  |  ' + ansi.reset +
+      colors.label + tr('Longest: ') + ansi.reset +
+      colors.value + ansi.bold + hd.streaks.longestStreak + tr(' days') + ansi.reset
+    );
+  }
+
+  lines.push('');
+  lines.push('  ' + drawSeparator(width - 3));
+  currentButtons = [
+    { label: tr('[r] Refresh'), action: 'heatmap_refresh' },
+  ];
+  buttonLineIdx = lines.length;
+  lines.push('  ' + buildHintText(currentButtons));
+  lines.push('');
+
+  renderPage(lines, buttonLineIdx, state);
+}
+
+// JSON-RPC via the v1.0 namespace API (hecaton.<ns>.<verb>) — the legacy
+// sendRpc dispatcher was removed in favor of direct proxy calls.
+
+// ============================================================
+// Main
+// ============================================================
+
+async function main() {
+  const state = {
+    loading: true,
+    error: null,
+    data: null,
+    config: { plan: 'max', displayMode: 'detailed' },
+    effort: 'high',
+    startTime: Date.now(),
+    lastRefresh: null,
+    refreshCount: 0,
+    minimized: hecaton.initialState?.minimized ?? false,
+    heatmapView: false,
+    agentView: false,
+    contentScroll: 0,
+    maxContentScroll: 0,
+    heatmapData: null,
+    heatmapLoading: false,
+    serviceStatus: null,
+    lastKnownServiceIssue: null,
+  };
+  let autoRefreshTimer = null;
+  let serviceStatusRefreshTimer = null;
+  let serviceStatusRefreshPromise = null;
+  let shuttingDown = false;
+
+  hecaton.on('locale_changed', params => {
+    setUiLocale(params?.locale);
+    setTooltip('');
+    rerender();
+  });
+  const agentState = createClaudeState(hecaton, {
+    onBack: () => selectView(0),
+    renderNavigation: () => renderNavigation(state),
+    onClose: () => { cleanup(); hecaton.window.close().catch(() => {}); },
+  });
+  function selectView(view) {
+    state.agentView = view === 1;
+    state.heatmapView = view === 2;
+    state.contentScroll = 0;
+    hoveredAreaIndex = -1;
+    setTooltip('');
+    hecaton.window.set_cursor({ cursor: 'default' }).catch(() => {});
+    agentState.show(state.agentView && !state.minimized);
+    if (state.heatmapView && !state.heatmapData) refreshHeatmap();
+    else rerender();
+  }
+  function scrollContent(delta) {
+    state.contentScroll = Math.max(0, Math.min(state.maxContentScroll, state.contentScroll + delta));
+    rerender();
+  }
+
+  // Initial render
+  rerender();
+
+  // Request notification permission before user config reads and monitoring.
+  await requestNotificationPermissionOnStartup();
+
+  // Load config
+  state.config = await loadConfig();
+  state.effort = await getEffortLevel();
+
+  // Fetch data
+  function rerender() {
+    if (shuttingDown) return;
+    if (state.minimized) renderMinimized(state);
+    else if (state.agentView) agentState.render();
+    else if (state.heatmapView) renderHeatmap(state);
+    else render(state);
+  }
+
+  async function refreshServiceStatus() {
+    if (serviceStatusRefreshPromise) return serviceStatusRefreshPromise;
+
+    serviceStatusRefreshPromise = (async () => {
+      const serviceStatus = await fetchClaudeStatus();
+      const recovered = applyServiceStatusResult(state, serviceStatus);
+
+      rerender();
+      if (recovered) await sendServiceRecoveryNotification();
+      return serviceStatus;
+    })();
+
+    try {
+      return await serviceStatusRefreshPromise;
+    } finally {
+      serviceStatusRefreshPromise = null;
+      scheduleServiceStatusRefresh();
+    }
+  }
+
+  async function refresh() {
+    state.loading = true;
+    state.error = null;
+    rerender();
+
+    try {
+      const token = await getCredentials();
+      if (!token) {
+        state.error = 'No credentials found';
+        state.loading = false;
+        rerender();
+        return;
+      }
+      const data = await fetchUsageLimits(token);
+      if (data && !data._error) {
+        state.data = data;
+        state.lastRefresh = Date.now();
+        state.refreshCount++;
+        await saveCache(data);
+      } else {
+        // API error -- fall back to cached data
+        const cached = await loadCache();
+        if (cached) {
+          state.data = cached;
+          state.data._fromCache = true;
+          state.lastRefresh = cached._cachedAt || null;
+        } else {
+          state.data = data; // show error message
+        }
+      }
+      state.loading = false;
+      rerender();
+    } catch (e) {
+      // Network error -- fall back to cached data
+      const cached = await loadCache();
+      if (cached) {
+        state.data = cached;
+        state.data._fromCache = true;
+        state.lastRefresh = cached._cachedAt || null;
+      } else {
+        state.error = { key: 'Failed to fetch: {error}', args: { error: e.message || tr('unknown') } };
+      }
+      state.loading = false;
+      rerender();
+    }
+  }
+
+  function refreshDashboard() {
+    refresh();
+    refreshServiceStatus();
+  }
+
+  async function refreshHeatmap() {
+    state.heatmapLoading = true;
+    rerender();
+    try {
+      state.heatmapData = await loadHeatmapData();
+    } catch {
+      state.heatmapData = null;
+    }
+    state.heatmapLoading = false;
+    rerender();
+  }
+
+  // Setup stdin to keep the deno event loop alive.
+  // Handle stdin for keyboard input
+  // In Hecaton plugin mode, stdin is a pipe (not TTY), so rawMode is not needed.
+  // The host forwards keystrokes as VT sequences directly.
+  try {
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+    }
+  } catch { /* ignore if not a TTY */ }
+  process.stdin.resume();
+  process.stdin.setEncoding('utf-8');
+
+  hecaton.on('window_resized', (params) => {
+    termCols = params.cols || termCols;
+    termRows = params.rows || termRows;
+    rerender();
+  });
+  hecaton.on('window_minimized', () => {
+    state.minimized = true;
+    agentState.show(false);
+    renderMinimized(state);
+  });
+  hecaton.on('window_restored', () => {
+    state.minimized = false;
+    agentState.show(state.agentView);
+    setTooltip('');
+    rerender();
+  });
+
+  process.stdin.on('data', (key) => {
+    if (!state.minimized) {
+      const direct = { '1': 0, '2': 1, '3': 2, d: 0, D: 0, h: 2, H: 2 };
+      if (Object.hasOwn(direct, key)) { selectView(direct[key]); return; }
+      if (key === '\t') { selectView(((state.agentView ? 1 : state.heatmapView ? 2 : 0) + 1) % 3); return; }
+      const navMouse = /\x1b\[<(\d+);(\d+);1([Mm])/.exec(key);
+      if (navMouse) {
+        if (navMouse[1] === '0' && navMouse[3] === 'M') {
+          const area = navigationAreas.find(a => Number(navMouse[2]) >= a.colStart && Number(navMouse[2]) <= a.colEnd);
+          if (area) selectView(area.view);
+        }
+        return;
+      }
+      if (!state.agentView && ['\x1b[A', '\x1b[B', '\x1b[5~', '\x1b[6~'].includes(key)) {
+        scrollContent(key === '\x1b[A' ? -1 : key === '\x1b[B' ? 1 : key === '\x1b[5~' ? -(termRows - 2) : termRows - 2);
+        return;
+      }
+    }
+
+    if ((key === 'a' || key === 'A') && !state.minimized) {
+      selectView(state.agentView ? 0 : 1);
+      return;
+    }
+    if (state.agentView && !state.minimized) {
+      if (key === 'Q') { cleanup(); hecaton.window.close().catch(() => {}); }
+      else agentState.input(key);
+      return;
+    }
+    // Handle SGR mouse sequences: ESC [ < Cb ; Cx ; Cy M/m
+    const mouseRegex = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+    let mouseMatch;
+    let hadMouse = false;
+    while ((mouseMatch = mouseRegex.exec(key)) !== null) {
+      hadMouse = true;
+      const cb = parseInt(mouseMatch[1], 10);
+      const cx = parseInt(mouseMatch[2], 10);
+      const cy = parseInt(mouseMatch[3], 10);
+      const isRelease = mouseMatch[4] === 'm';
+
+      // Motion events (cb bit 5 set)
+      if ((cb & 32) !== 0) {
+        if (state.minimized) {
+          updateMinimizedTooltip(cx, cy);
+          continue;
+        }
+        let newHover = -1;
+        for (let i = 0; i < clickableAreas.length; i++) {
+          const area = clickableAreas[i];
+          if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
+            newHover = i;
+            break;
+          }
+        }
+        if (newHover !== hoveredAreaIndex) {
+          hoveredAreaIndex = newHover;
+          rerender();
+        }
+        continue;
+      }
+
+      if (isRelease) continue;
+
+      // Scroll wheel up -> refresh
+      if (cb === 64) { if (!state.minimized) scrollContent(-3); continue; }
+      if (cb === 65) { if (!state.minimized) scrollContent(3); continue; }
+
+      // Left click -> check clickable areas
+      if (cb === 0) {
+        for (const area of clickableAreas) {
+          if (cy === area.row && cx >= area.colStart && cx <= area.colEnd) {
+            switch (area.action) {
+              case 'agent_toggle': selectView(1); break;
+              case 'refresh': refreshDashboard(); break;
+              case 'heatmap_toggle':
+                if (!state.minimized) {
+                  state.heatmapView = !state.heatmapView;
+                  if (state.heatmapView && !state.heatmapData) refreshHeatmap();
+                  else rerender();
+                }
+                break;
+              case 'heatmap_refresh': refreshHeatmap(); break;
+            }
+            break;
+          }
+        }
+      }
+    }
+    if (hadMouse) return;
+
+    switch (key) {
+      case 'r':
+      case 'R':
+        if (state.heatmapView) {
+          refreshHeatmap();
+          refreshServiceStatus();
+        } else {
+          refreshDashboard();
+        }
+        break;
+      case 'h':
+      case 'H':
+        if (state.minimized) break;
+        state.heatmapView = !state.heatmapView;
+        if (state.heatmapView && !state.heatmapData) refreshHeatmap();
+        else rerender();
+        break;
+      case 'q':
+      case 'Q':
+        cleanup();
+        hecaton.window.close().catch(() => {});
+        break;
+    }
+  });
+
+  // Auto-refresh with dynamic interval (backs off on 429)
+  function scheduleAutoRefresh() {
+    if (shuttingDown) return;
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(async () => {
+      try { await refresh(); } catch { /* ignore */ }
+      scheduleAutoRefresh();
+    }, autoRefreshMs);
+  }
+
+  function scheduleServiceStatusRefresh() {
+    if (shuttingDown) return;
+    if (serviceStatusRefreshTimer) clearTimeout(serviceStatusRefreshTimer);
+    const refreshMs = state.lastKnownServiceIssue === true
+      ? STATUS_REFRESH_OUTAGE_MS
+      : STATUS_REFRESH_NORMAL_MS;
+    serviceStatusRefreshTimer = setTimeout(() => {
+      refreshServiceStatus().catch(() => {});
+    }, refreshMs);
+  }
+
+  function cleanup() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    agentState.dispose();
+    clearTimeout(autoRefreshTimer);
+    clearTimeout(serviceStatusRefreshTimer);
+    setTooltip('');
+    process.stdout.write(ansi.showCursor + ansi.reset + ansi.clear);
+  }
+
+  // Graceful shutdown
+  const shutdown = () => {
+    if (shuttingDown) return;
+    cleanup();
+    setTimeout(() => process.exit(0), 60);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  process.stdin.on('end', shutdown);
+  process.stdin.on('close', shutdown);
+
+  agentState.start().catch(e => process.stderr.write('Agent State: ' + e.message + '\n'));
+
+  // Start initial refresh and auto-refresh (AFTER stdin is registered)
+  refresh();
+  refreshServiceStatus();
+  scheduleAutoRefresh();
+}
+
+main().catch((e) => {
+  process.stderr.write('Error: ' + (e && e.message ? e.message : e) + '\n');
+  process.exit(1);
+});
