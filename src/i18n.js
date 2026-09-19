@@ -9,6 +9,18 @@ function tr(key, args = {}) {
   const value = UI_CATALOGS[uiLocale][key] ?? UI_CATALOGS.en[key] ?? key;
   return value.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(args, name) ? String(args[name]) : match);
 }
+// Host-facing text (permission prompts) is picked by the host, not by us: it
+// takes a {en, ko, ...} map and applies its own plugin-language setting. Send
+// every catalog we have and let it choose.
+function translations(key, args = {}) {
+  const map = {};
+  for (const tag of Object.keys(UI_CATALOGS)) {
+    const value = UI_CATALOGS[tag][key] ?? UI_CATALOGS.en[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    map[tag] = value.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(args, name) ? String(args[name]) : match);
+  }
+  return Object.keys(map).length ? map : tr(key, args);
+}
 function messageText(message) {
   return message && typeof message === 'object' ? tr(message.key, message.args) : tr(String(message || ''));
 }

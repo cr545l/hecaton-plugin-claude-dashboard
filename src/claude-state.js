@@ -385,6 +385,9 @@ let serverId = null;
 let serverRunning = false;
 let patternEnabled = false;
 let subscriptionId = null;
+// Set once terminal_status is refused: the badge is optional decoration, and
+// re-asking on every transition would turn one refusal into a prompt storm.
+let badgesBlocked = false;
 const connections = new Map();
 const log = [];
 const MAX_LOG = 200;
@@ -432,6 +435,11 @@ async function refreshTerminalInfo() {
   if (terminalListMissing) return;
   try {
     const r = await hecaton.terminal.list();
+    if (r && r.ok === false) {
+      terminalListMissing = true;
+      addLog(`terminal.list refused: ${r.error_code || r.error || 'unknown'} — notifications will use terminal ids`);
+      return;
+    }
     if (!terminalListLogged) {
       terminalListLogged = true;
       addLog(`terminal.list → ${JSON.stringify(r).slice(0, 240)}`);
@@ -533,6 +541,24 @@ function shouldNotify(terminalId, key) {
   return true;
 }
 
+// terminal_status is a separate grant from terminal_list. Refusing it should
+// cost the badge and nothing else — state tracking and notifications carry on.
+async function setTerminalBadge(terminalId, badge) {
+  if (badgesBlocked) return;
+  try {
+    const r = await hecaton.terminal.set_status({ terminal_id: terminalId, ...badge });
+    if (r && r.ok === false) {
+      badgesBlocked = r.error_code === 'access_denied';
+      addLog(`terminal.set_status refused: ${r.error_code || r.error || 'unknown'}`);
+      if (badgesBlocked) rerender();
+    }
+  } catch (e) {
+    addLog(`terminal.set_status failed: ${e && e.message ? e.message : e}`);
+  }
+}
+
+const CLEAR_BADGE = { label: '', icon: '', color: '', detail: '' };
+
 sm.onTransition = async (terminalId, from, to, info) => {
   const agent = info.agent || 'unknown';
 
@@ -540,7 +566,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
     addLog(`[${agent}] T${terminalId} session ended`);
     lastNotify.delete(`${terminalId}:Stop`);
     compacting.delete(terminalId);
-    await hecaton.terminal.set_status({ terminal_id: terminalId, label: '', icon: '', color: '', detail: '' });
+    await setTerminalBadge(terminalId, CLEAR_BADGE);
     return;
   }
 
@@ -551,7 +577,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
 
   addLog(`[${agent}] T${terminalId} ${from || 'null'} → ${to} (${info.reason || '?'})`);
 
-  await hecaton.terminal.set_status({ terminal_id: terminalId, label, icon: 'radio-tower', color, detail });
+  await setTerminalBadge(terminalId, { label, icon: 'radio-tower', color, detail });
 
   // Pattern matching has no hook event — its running->waiting means "turn done".
   const key = info.reason === 'pattern'
@@ -561,7 +587,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
   if (!shouldNotify(terminalId, key)) return;
 
   const body = (NOTIFY_BODY[key] || NOTIFY_BODY.Stop)(describeTerminal(terminalId, agent));
-  await hecaton.notify.send({ terminal_id: terminalId, title: tr('Claude State'), body });
+  await sendNotification({ terminal_id: terminalId, title: tr('Claude State'), body }, 'permission.reason.agent');
 };
 
 // ============================================================
@@ -658,6 +684,11 @@ async function onTerminalChanged(params) {
   if (!patternEnabled) return;
   try {
     const cells = await hecaton.terminal.get_cells({ since_version: 0 });
+    if (cells && cells.ok === false) {
+      addLog(`terminal.get_cells refused: ${cells.error_code || cells.error || 'unknown'}`);
+      await stopPatternMatching();
+      return;
+    }
     if (!cells || !cells.rows_data) return;
     if (cells.version === lastCellVersion) return;
     lastCellVersion = cells.version;
@@ -800,6 +831,11 @@ async function startPatternMatching() {
   if (result && result.subscription_id) {
     subscriptionId = result.subscription_id;
     addLog(`Subscribed: ${subscriptionId}`);
+  } else {
+    // cross_terminal refused, or the host has no subscription API: the screen
+    // reader can never fire, so turn the toggle back off instead of lying.
+    patternEnabled = false;
+    addLog(`terminal.subscribe failed: ${result && (result.error_code || result.error) || 'no subscription id'}`);
   }
   rerender();
 }
@@ -951,6 +987,13 @@ function rerender() {
     const nextHot = zone(row, 19, 19, 'preset-next', { label: tr('Next preset') });
     out += ansi.moveTo(row, 19) + (nextHot ? ansi.bg.hover + ansi.bold : ansi.dim) + '>' + ansi.reset;
 
+    // A screen of notification toggles is a lie once the host has refused the
+    // permission — say so where the toggles are.
+    if (notificationsBlocked()) {
+      const warn = clipCells(tr('permission.notify.blocked'), Math.max(0, Math.max(24, W - 11) - 22));
+      out += ansi.moveTo(row, 21) + ansi.fg.red + warn + ansi.reset;
+    }
+
     const btnCol = Math.max(24, W - 11);
     const btnHot = zone(row, btnCol, btnCol + displayWidth(tr('Reset')) + 3, 'reset-notify', { label: tr('Reset to default preset') });
     out += ansi.moveTo(row, btnCol) + button(tr('Reset'), btnHot, ansi.fg.cyan);
@@ -985,6 +1028,9 @@ function rerender() {
   out += ansi.moveTo(row, 2) + ansi.bold + tr('Terminals') + ansi.reset;
   if (tracked.length) {
     out += ansi.dim + `  (${tracked.length})` + ansi.reset;
+  }
+  if (badgesBlocked) {
+    out += ansi.dim + ansi.fg.red + '  ' + clipCells(tr('permission.badge.blocked'), Math.max(0, W - 16)) + ansi.reset;
   }
   row++;
   if (tracked.length === 0) {
@@ -1086,9 +1132,9 @@ hecaton.on('locale_changed', (params) => {
   rerender();
   for (const terminal of sm.getAll()) {
     const detail = terminal.model ? `${terminal.model} (${tr(terminal.state)})` : tr(terminal.state);
-    hecaton.terminal.set_status({ terminal_id: terminal.id,
+    setTerminalBadge(terminal.id, {
       label: `${STATE_ICONS[terminal.state] || '?'} ${terminal.agent || 'unknown'}`,
-      icon: 'radio-tower', color: STATE_COLORS[terminal.state] || '#FFFFFF', detail }).catch(() => {});
+      icon: 'radio-tower', color: STATE_COLORS[terminal.state] || '#FFFFFF', detail });
   }
 });
 hecaton.on('ws_connected', (params) => {
@@ -1145,8 +1191,7 @@ function runAction(action) {
     if (!Number.isFinite(id)) return;
     sm.remove(id);
     compacting.delete(id);
-    hecaton.terminal.set_status({ terminal_id: id, label: '', icon: '', color: '', detail: '' })
-      .catch(() => null);
+    setTerminalBadge(id, CLEAR_BADGE);
     addLog(`T${id} cleared`);
     return;
   }

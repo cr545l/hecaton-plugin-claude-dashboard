@@ -3,7 +3,7 @@
   "name": "Claude Dashboard",
   "version": "1.6.0",
   "entry": "main.js",
-  "apiVersion": "1.4",
+  "apiVersion": "1.15",
   "overlay": {
     "mode": "floating",
     "width": "70%",
@@ -17,7 +17,38 @@
     "minimized_label": "Claude",
     "minimized_label_color": "#D76946"
   },
-  "permissions": [
-    "perm:notification"
-  ]
+  "permission_usage_descriptions": {
+    "notification": {
+      "en": "Tell you when a Claude turn finishes, when it stops for your approval, and when a Claude service outage is over, so you do not have to watch the dashboard. Notifications name the terminal and are sent only on those state changes.",
+      "ko": "Claude 작업이 끝났을 때, 승인을 기다리며 멈췄을 때, Claude 서비스 장애가 해소됐을 때 알려 드려 대시보드를 계속 보고 있지 않아도 되게 합니다. 알림에는 해당 터미널 이름을 표시하며 이러한 상태 변화에만 보냅니다."
+    },
+    "fs_read": {
+      "en": "Read the Claude Code settings, credential and session files under your home .claude folder to show your plan, rate limits, thinking effort and the activity heatmap.",
+      "ko": "요금제·사용 한도·사고 강도·활동 기록을 표시하기 위해 홈 폴더의 .claude 아래에 있는 Claude Code 설정·인증·세션 파일을 읽습니다."
+    },
+    "fs_write": {
+      "en": "Save this dashboard's usage cache, notification settings and diagnostic log, and write the Claude Code hook entries into settings.json when you choose Install in the hook dialog.",
+      "ko": "이 대시보드의 사용량 캐시·알림 설정·진단 로그를 저장하고, 훅 설치 창에서 Install을 선택하면 settings.json에 Claude Code 훅 항목을 기록합니다."
+    },
+    "process_exec": {
+      "en": "Run the macOS security command to read the Claude Code login token from your keychain, used only when no credentials file exists. The token is sent to the Claude usage API and never stored by this plugin.",
+      "ko": "인증 파일이 없을 때만 macOS의 security 명령을 실행해 키체인에서 Claude Code 로그인 토큰을 읽습니다. 토큰은 Claude 사용량 API 호출에만 쓰이며 이 플러그인이 따로 저장하지 않습니다."
+    },
+    "network_serve": {
+      "en": "Listen on 127.0.0.1 port 9218 so Claude Code hooks running on this machine can report session state to the dashboard. The server accepts local connections only.",
+      "ko": "이 컴퓨터에서 실행되는 Claude Code 훅이 세션 상태를 대시보드로 보낼 수 있도록 127.0.0.1의 9218 포트에서 대기합니다. 로컬 연결만 받습니다."
+    },
+    "terminal_list": {
+      "en": "Read the names of open terminals so badges and notifications can say which terminal your Claude session runs in instead of showing a numeric id.",
+      "ko": "배지와 알림에 숫자 ID 대신 Claude 세션이 실행 중인 터미널 이름을 쓰기 위해 열린 터미널의 이름을 읽습니다."
+    },
+    "terminal_status": {
+      "en": "Show a running, waiting or blocked badge on the terminal where Claude is working, and clear that badge when the session ends.",
+      "ko": "Claude가 작업 중인 터미널에 실행 중·대기·차단 배지를 표시하고 세션이 끝나면 배지를 지웁니다."
+    },
+    "cross_terminal": {
+      "en": "Read the last lines drawn on the terminal screen to recognise the Claude prompt when you turn pattern matching on. This is the fallback for when hooks are unavailable and it stays off until you start it.",
+      "ko": "패턴 감지를 켰을 때 터미널 화면에 그려진 마지막 줄들을 읽어 Claude 프롬프트를 인식합니다. 훅을 쓸 수 없을 때를 위한 대체 수단이며 직접 시작하기 전까지는 꺼져 있습니다."
+    }
+  }
 }

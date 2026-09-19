@@ -7,11 +7,12 @@ const { EventEmitter } = require('node:events');
 const root = path.resolve(__dirname, '..');
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
 
-async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200 } = {}) {
+async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200, permission = 'granted', notifySend, deny = [] } = {}) {
   const events = new EventEmitter();
   const stdin = new EventEmitter();
   Object.assign(stdin, { resume() {}, setEncoding() {}, isTTY: false });
   const calls = [], output = [], files = new Map(), timers = new Map();
+  let permissionState = permission;
   let timer = 0;
   if (authenticated) files.set('/home/.claude/.credentials.json', JSON.stringify({ claudeAiOauth: { accessToken: 'mock-token' } }));
   if (legacy) files.set('/home/.hecaton/data/dev.hecaton.claude-hook/config.json', JSON.stringify(legacy));
@@ -24,6 +25,7 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
       if (ns in target) return target[ns];
       return new Proxy({}, { get: (_, verb) => async args => {
         calls.push({ method: `${ns}.${verb}`, args });
+        if (deny.includes(`${ns}.${verb}`)) return { ok: false, error_code: 'access_denied' };
         if (ns === 'env') {
           if (verb === 'get_home') return { path: '/home' };
           return { value: { HECA_COLS: String(cols), HECA_ROWS: '40', HECA_LOCALE: envLocale, HECA_PLUGIN_DATA_DIR: '/home/.hecaton/data/dev.hecaton.claude-dashboard' }[args.name] || '' };
@@ -33,7 +35,15 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
           return files.has(args.path) ? { ok: true, content: files.get(args.path) } : { ok: false };
         }
         if (ns === 'fs' && verb === 'write_file') { files.set(args.path, args.content); return { ok: true }; }
-        if (ns === 'permissions') return { state: 'granted' };
+        if (ns === 'permissions') {
+          if (verb === 'request') {
+            // The host stores the answer, so a second request never reaches a prompt.
+            permissionState = permissionState === 'denied' ? 'denied' : 'granted';
+            return { state: permissionState, granted: permissionState === 'granted' };
+          }
+          return { state: permissionState };
+        }
+        if (ns === 'notify' && verb === 'send') return notifySend ? notifySend() : { ok: true };
         if (ns === 'web' && verb === 'serve') return serve ? serve() : { ok: true, server_id: 7, port: 9218 };
         if (ns === 'terminal' && verb === 'list') return { terminals: [{ id: 42, title: 'test project' }] };
         if (ns === 'terminal' && verb === 'subscribe') return { subscription_id: 9 };
@@ -58,7 +68,7 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
   const emit = async (name, data) => { events.emit(name, data); await flush(); };
   const input = async key => { stdin.emit('data', key); await flush(); };
   const hook = async event => emit('http_request_received', { method: 'POST', path: '/hook', body: JSON.stringify({ client: 'claude', terminal_id: 42, event }) });
-  return { calls, output, files, emit, input, hook, stdin, timers, textHelpers, frame: () => output.join('').split('\x1b[2J').at(-1) };
+  return { calls, output, files, emit, input, hook, stdin, timers, textHelpers, setPermission: next => { permissionState = next; }, frame: () => output.join('').split('\x1b[2J').at(-1) };
 }
 
 test('background hooks update badges and notify without overwriting dashboard', async () => {
@@ -274,4 +284,58 @@ test('authenticated API error responses still render the refresh button without 
     await h.input('r');
     assert.ok(!h.calls.some(c => c.method === 'exit'));
   }
+});
+
+test('a stored denial is respected: no prompt, no notification, and the screen says so', async () => {
+  const h = await harness({ permission: 'denied' });
+  await h.hook('UserPromptSubmit');
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'permissions.request').length, 0);
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 0);
+  assert.deepEqual(h.calls.filter(c => c.method === 'terminal.set_status').map(c => c.args.detail), ['running', 'waiting']);
+  await h.input('a');
+  assert.match(h.frame(), /notifications blocked/);
+});
+
+test('the startup prompt carries a purpose in every language the plugin ships', async () => {
+  const h = await harness({ permission: 'prompt' });
+  const requests = h.calls.filter(c => c.method === 'permissions.request');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].args.permission, 'notification');
+  assert.deepEqual(Object.keys(requests[0].args.reason).sort(), ['en', 'ko']);
+  assert.match(requests[0].args.reason.en, /Claude turn finishes/);
+  assert.match(requests[0].args.reason.ko, /Claude 작업이 끝났을 때/);
+  await h.hook('UserPromptSubmit');
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'permissions.request').length, 1, 'the stored answer is not re-asked');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1);
+});
+
+test('a permission revoked after the preflight surfaces instead of failing silently', async () => {
+  const h = await harness({ notifySend: () => ({ ok: false, error_code: 'access_denied' }) });
+  await h.hook('UserPromptSubmit');
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1);
+  await h.input('a');
+  assert.match(h.frame(), /notifications blocked/);
+});
+
+test('a refused terminal badge costs the badge and nothing else', async () => {
+  const h = await harness({ deny: ['terminal.set_status'] });
+  await h.hook('UserPromptSubmit');
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'terminal.set_status').length, 1, 'one refusal is not re-asked');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1, 'notifications are a separate grant');
+  await h.input('a');
+  assert.match(h.frame(), /terminal badges blocked/);
+});
+
+test('pattern matching turns itself back off when screen access is refused', async () => {
+  const h = await harness({ deny: ['terminal.subscribe'] });
+  await h.input('a');
+  await h.input('p');
+  assert.equal(h.calls.filter(c => c.method === 'terminal.subscribe').length, 1);
+  await h.emit('terminal_changed', {});
+  assert.equal(h.calls.filter(c => c.method === 'terminal.get_cells').length, 0, 'the screen reader must stay off');
+  assert.match(h.frame(), /terminal\.subscribe failed: access_denied/);
 });

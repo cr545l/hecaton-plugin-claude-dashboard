@@ -102,6 +102,11 @@ const UI_CATALOGS = {
     "turn complete": "turn complete",
     "turn ended with error": "turn ended with error",
     "permission prompt (mid-turn)": "permission prompt (mid-turn)",
+    "permission.reason.startup": "Tell you when a Claude turn finishes, when Claude stops for your approval, and when a Claude service outage is over, so you do not have to keep this dashboard in view. Notifications name the terminal and are sent only on those state changes.",
+    "permission.reason.agent": "Tell you that the Claude session in the terminal being tracked has finished its turn, ended with an error, or is waiting for your approval.",
+    "permission.reason.recovery": "Tell you the moment the Claude service outage shown on this dashboard is over, so you can pick your work back up.",
+    "permission.notify.blocked": "notifications blocked",
+    "permission.badge.blocked": "terminal badges blocked",
     "session start / resume / clear": "session start / resume / clear",
     "idle prompt after 60s": "idle prompt after 60s",
     "Mon": "Mon",
@@ -258,6 +263,11 @@ const UI_CATALOGS = {
     "turn complete": "턴 완료",
     "turn ended with error": "오류로 턴 종료",
     "permission prompt (mid-turn)": "권한 승인 요청 (진행 중)",
+    "permission.reason.startup": "Claude 작업이 끝났을 때, 승인을 기다리며 멈췄을 때, Claude 서비스 장애가 해소됐을 때 알려 드려 이 대시보드를 계속 보고 있지 않아도 되게 합니다. 알림에는 해당 터미널 이름을 표시하며 이러한 상태 변화에만 보냅니다.",
+    "permission.reason.agent": "추적 중인 터미널의 Claude 세션이 작업을 마쳤거나, 오류로 끝났거나, 승인을 기다리고 있다는 사실을 알려 드립니다.",
+    "permission.reason.recovery": "이 대시보드에 표시된 Claude 서비스 장애가 해소되는 즉시 알려 드려 작업을 이어갈 수 있게 합니다.",
+    "permission.notify.blocked": "알림 차단됨",
+    "permission.badge.blocked": "터미널 배지 차단됨",
     "session start / resume / clear": "세션 시작 / 재개 / 초기화",
     "idle prompt after 60s": "60초 후 유휴 알림",
     "Mon": "월",
@@ -324,6 +334,18 @@ function setUiLocale(tag) {
 function tr(key, args = {}) {
   const value = UI_CATALOGS[uiLocale][key] ?? UI_CATALOGS.en[key] ?? key;
   return value.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(args, name) ? String(args[name]) : match);
+}
+// Host-facing text (permission prompts) is picked by the host, not by us: it
+// takes a {en, ko, ...} map and applies its own plugin-language setting. Send
+// every catalog we have and let it choose.
+function translations(key, args = {}) {
+  const map = {};
+  for (const tag of Object.keys(UI_CATALOGS)) {
+    const value = UI_CATALOGS[tag][key] ?? UI_CATALOGS.en[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    map[tag] = value.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(args, name) ? String(args[name]) : match);
+  }
+  return Object.keys(map).length ? map : tr(key, args);
 }
 function messageText(message) {
   return message && typeof message === 'object' ? tr(message.key, message.args) : tr(String(message || ''));
@@ -829,32 +851,71 @@ async function fetchClaudeStatus() {
   }
 }
 
-async function sendServiceRecoveryNotification() {
+// ============================================================
+// Notification permission
+// ============================================================
+// The prompt text defaults to permission_usage_descriptions in plugin.json; a
+// per-request `reason` replaces it with the purpose of that one request. The
+// host stores the answer: a denial must never be re-prompted, and rewording
+// the reason does not reset it. A grant can also be revoked after the
+// preflight, so every notify.send result is checked as well.
+const notificationPermission = { state: 'unknown', granted: false };
+
+function noteNotificationPermission(result) {
+  if (!result || typeof result !== 'object') return;
+  if (typeof result.state === 'string') notificationPermission.state = result.state;
+  if (result.error_code === 'access_denied') notificationPermission.state = 'denied';
+  notificationPermission.granted = notificationPermission.state === 'granted' ||
+    (result.granted === true && notificationPermission.state !== 'denied');
+}
+
+function notificationsBlocked() {
+  return notificationPermission.state === 'denied';
+}
+
+// False only for a decision already known to be "no". An unreachable
+// permissions API is not a denial — let the send itself fail honestly.
+async function ensureNotificationPermission(reasonKey) {
   try {
-    await hecaton.notify.send({
-      title: tr('Claude Service Restored'),
-      body: tr('Claude services are operational again.'),
-    });
+    noteNotificationPermission(await hecaton.permissions.query({ permission: 'notification' }));
+    if (notificationPermission.state === 'denied') return false;
+    if (notificationPermission.state !== 'prompt') return true;
+
+    noteNotificationPermission(await hecaton.permissions.request({
+      permission: 'notification',
+      reason: translations(reasonKey),
+    }));
+    return notificationPermission.granted;
   } catch (e) {
-    process.stderr.write('[claude-dashboard] Recovery notification failed: ' + (e.message || e) + '\n');
+    process.stderr.write('[claude-dashboard] Notification permission check failed: ' + (e.message || e) + '\n');
+    return true;
   }
 }
 
-async function requestNotificationPermissionOnStartup() {
-  try {
-    const current = await hecaton.permissions.query({
-      permission: 'notification',
-    });
-
-    if (current.state !== 'prompt') return current;
-
-    return await hecaton.permissions.request({
-      permission: 'notification',
-    });
-  } catch (e) {
-    process.stderr.write('[claude-dashboard] Notification permission preflight failed: ' + (e.message || e) + '\n');
-    return { granted: false, state: 'unavailable' };
+async function sendNotification(payload, reasonKey) {
+  if (!await ensureNotificationPermission(reasonKey)) {
+    process.stderr.write('[claude-dashboard] Notification suppressed: permission not granted\n');
+    return { ok: false, error_code: 'access_denied' };
   }
+  try {
+    const result = await hecaton.notify.send(payload);
+    if (result && result.ok === false) {
+      noteNotificationPermission(result);
+      process.stderr.write('[claude-dashboard] notify.send failed: ' + JSON.stringify(result) + '\n');
+      return result;
+    }
+    return result || { ok: true };
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] notify.send failed: ' + (e.message || e) + '\n');
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+async function sendServiceRecoveryNotification() {
+  return sendNotification({
+    title: tr('Claude Service Restored'),
+    body: tr('Claude services are operational again.'),
+  }, 'permission.reason.recovery');
 }
 
 function applyServiceStatusResult(state, serviceStatus) {
@@ -1633,8 +1694,9 @@ async function main() {
   // Initial render
   rerender();
 
-  // Request notification permission before user config reads and monitoring.
-  await requestNotificationPermissionOnStartup();
+  // Ask once, up front. The first notification is raised by a background event,
+  // and a prompt opened then would land on a screen nobody is looking at.
+  await ensureNotificationPermission('permission.reason.startup');
 
   // Load config
   state.config = await loadConfig();
@@ -2318,6 +2380,9 @@ let serverId = null;
 let serverRunning = false;
 let patternEnabled = false;
 let subscriptionId = null;
+// Set once terminal_status is refused: the badge is optional decoration, and
+// re-asking on every transition would turn one refusal into a prompt storm.
+let badgesBlocked = false;
 const connections = new Map();
 const log = [];
 const MAX_LOG = 200;
@@ -2365,6 +2430,11 @@ async function refreshTerminalInfo() {
   if (terminalListMissing) return;
   try {
     const r = await hecaton.terminal.list();
+    if (r && r.ok === false) {
+      terminalListMissing = true;
+      addLog(`terminal.list refused: ${r.error_code || r.error || 'unknown'} — notifications will use terminal ids`);
+      return;
+    }
     if (!terminalListLogged) {
       terminalListLogged = true;
       addLog(`terminal.list → ${JSON.stringify(r).slice(0, 240)}`);
@@ -2466,6 +2536,24 @@ function shouldNotify(terminalId, key) {
   return true;
 }
 
+// terminal_status is a separate grant from terminal_list. Refusing it should
+// cost the badge and nothing else — state tracking and notifications carry on.
+async function setTerminalBadge(terminalId, badge) {
+  if (badgesBlocked) return;
+  try {
+    const r = await hecaton.terminal.set_status({ terminal_id: terminalId, ...badge });
+    if (r && r.ok === false) {
+      badgesBlocked = r.error_code === 'access_denied';
+      addLog(`terminal.set_status refused: ${r.error_code || r.error || 'unknown'}`);
+      if (badgesBlocked) rerender();
+    }
+  } catch (e) {
+    addLog(`terminal.set_status failed: ${e && e.message ? e.message : e}`);
+  }
+}
+
+const CLEAR_BADGE = { label: '', icon: '', color: '', detail: '' };
+
 sm.onTransition = async (terminalId, from, to, info) => {
   const agent = info.agent || 'unknown';
 
@@ -2473,7 +2561,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
     addLog(`[${agent}] T${terminalId} session ended`);
     lastNotify.delete(`${terminalId}:Stop`);
     compacting.delete(terminalId);
-    await hecaton.terminal.set_status({ terminal_id: terminalId, label: '', icon: '', color: '', detail: '' });
+    await setTerminalBadge(terminalId, CLEAR_BADGE);
     return;
   }
 
@@ -2484,7 +2572,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
 
   addLog(`[${agent}] T${terminalId} ${from || 'null'} → ${to} (${info.reason || '?'})`);
 
-  await hecaton.terminal.set_status({ terminal_id: terminalId, label, icon: 'radio-tower', color, detail });
+  await setTerminalBadge(terminalId, { label, icon: 'radio-tower', color, detail });
 
   // Pattern matching has no hook event — its running->waiting means "turn done".
   const key = info.reason === 'pattern'
@@ -2494,7 +2582,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
   if (!shouldNotify(terminalId, key)) return;
 
   const body = (NOTIFY_BODY[key] || NOTIFY_BODY.Stop)(describeTerminal(terminalId, agent));
-  await hecaton.notify.send({ terminal_id: terminalId, title: tr('Claude State'), body });
+  await sendNotification({ terminal_id: terminalId, title: tr('Claude State'), body }, 'permission.reason.agent');
 };
 
 // ============================================================
@@ -2591,6 +2679,11 @@ async function onTerminalChanged(params) {
   if (!patternEnabled) return;
   try {
     const cells = await hecaton.terminal.get_cells({ since_version: 0 });
+    if (cells && cells.ok === false) {
+      addLog(`terminal.get_cells refused: ${cells.error_code || cells.error || 'unknown'}`);
+      await stopPatternMatching();
+      return;
+    }
     if (!cells || !cells.rows_data) return;
     if (cells.version === lastCellVersion) return;
     lastCellVersion = cells.version;
@@ -2733,6 +2826,11 @@ async function startPatternMatching() {
   if (result && result.subscription_id) {
     subscriptionId = result.subscription_id;
     addLog(`Subscribed: ${subscriptionId}`);
+  } else {
+    // cross_terminal refused, or the host has no subscription API: the screen
+    // reader can never fire, so turn the toggle back off instead of lying.
+    patternEnabled = false;
+    addLog(`terminal.subscribe failed: ${result && (result.error_code || result.error) || 'no subscription id'}`);
   }
   rerender();
 }
@@ -2884,6 +2982,13 @@ function rerender() {
     const nextHot = zone(row, 19, 19, 'preset-next', { label: tr('Next preset') });
     out += ansi.moveTo(row, 19) + (nextHot ? ansi.bg.hover + ansi.bold : ansi.dim) + '>' + ansi.reset;
 
+    // A screen of notification toggles is a lie once the host has refused the
+    // permission — say so where the toggles are.
+    if (notificationsBlocked()) {
+      const warn = clipCells(tr('permission.notify.blocked'), Math.max(0, Math.max(24, W - 11) - 22));
+      out += ansi.moveTo(row, 21) + ansi.fg.red + warn + ansi.reset;
+    }
+
     const btnCol = Math.max(24, W - 11);
     const btnHot = zone(row, btnCol, btnCol + displayWidth(tr('Reset')) + 3, 'reset-notify', { label: tr('Reset to default preset') });
     out += ansi.moveTo(row, btnCol) + button(tr('Reset'), btnHot, ansi.fg.cyan);
@@ -2918,6 +3023,9 @@ function rerender() {
   out += ansi.moveTo(row, 2) + ansi.bold + tr('Terminals') + ansi.reset;
   if (tracked.length) {
     out += ansi.dim + `  (${tracked.length})` + ansi.reset;
+  }
+  if (badgesBlocked) {
+    out += ansi.dim + ansi.fg.red + '  ' + clipCells(tr('permission.badge.blocked'), Math.max(0, W - 16)) + ansi.reset;
   }
   row++;
   if (tracked.length === 0) {
@@ -3019,9 +3127,9 @@ hecaton.on('locale_changed', (params) => {
   rerender();
   for (const terminal of sm.getAll()) {
     const detail = terminal.model ? `${terminal.model} (${tr(terminal.state)})` : tr(terminal.state);
-    hecaton.terminal.set_status({ terminal_id: terminal.id,
+    setTerminalBadge(terminal.id, {
       label: `${STATE_ICONS[terminal.state] || '?'} ${terminal.agent || 'unknown'}`,
-      icon: 'radio-tower', color: STATE_COLORS[terminal.state] || '#FFFFFF', detail }).catch(() => {});
+      icon: 'radio-tower', color: STATE_COLORS[terminal.state] || '#FFFFFF', detail });
   }
 });
 hecaton.on('ws_connected', (params) => {
@@ -3078,8 +3186,7 @@ function runAction(action) {
     if (!Number.isFinite(id)) return;
     sm.remove(id);
     compacting.delete(id);
-    hecaton.terminal.set_status({ terminal_id: id, label: '', icon: '', color: '', detail: '' })
-      .catch(() => null);
+    setTerminalBadge(id, CLEAR_BADGE);
     addLog(`T${id} cleared`);
     return;
   }

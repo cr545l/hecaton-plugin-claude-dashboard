@@ -458,32 +458,71 @@ async function fetchClaudeStatus() {
   }
 }
 
-async function sendServiceRecoveryNotification() {
+// ============================================================
+// Notification permission
+// ============================================================
+// The prompt text defaults to permission_usage_descriptions in plugin.json; a
+// per-request `reason` replaces it with the purpose of that one request. The
+// host stores the answer: a denial must never be re-prompted, and rewording
+// the reason does not reset it. A grant can also be revoked after the
+// preflight, so every notify.send result is checked as well.
+const notificationPermission = { state: 'unknown', granted: false };
+
+function noteNotificationPermission(result) {
+  if (!result || typeof result !== 'object') return;
+  if (typeof result.state === 'string') notificationPermission.state = result.state;
+  if (result.error_code === 'access_denied') notificationPermission.state = 'denied';
+  notificationPermission.granted = notificationPermission.state === 'granted' ||
+    (result.granted === true && notificationPermission.state !== 'denied');
+}
+
+function notificationsBlocked() {
+  return notificationPermission.state === 'denied';
+}
+
+// False only for a decision already known to be "no". An unreachable
+// permissions API is not a denial — let the send itself fail honestly.
+async function ensureNotificationPermission(reasonKey) {
   try {
-    await hecaton.notify.send({
-      title: tr('Claude Service Restored'),
-      body: tr('Claude services are operational again.'),
-    });
+    noteNotificationPermission(await hecaton.permissions.query({ permission: 'notification' }));
+    if (notificationPermission.state === 'denied') return false;
+    if (notificationPermission.state !== 'prompt') return true;
+
+    noteNotificationPermission(await hecaton.permissions.request({
+      permission: 'notification',
+      reason: translations(reasonKey),
+    }));
+    return notificationPermission.granted;
   } catch (e) {
-    process.stderr.write('[claude-dashboard] Recovery notification failed: ' + (e.message || e) + '\n');
+    process.stderr.write('[claude-dashboard] Notification permission check failed: ' + (e.message || e) + '\n');
+    return true;
   }
 }
 
-async function requestNotificationPermissionOnStartup() {
-  try {
-    const current = await hecaton.permissions.query({
-      permission: 'notification',
-    });
-
-    if (current.state !== 'prompt') return current;
-
-    return await hecaton.permissions.request({
-      permission: 'notification',
-    });
-  } catch (e) {
-    process.stderr.write('[claude-dashboard] Notification permission preflight failed: ' + (e.message || e) + '\n');
-    return { granted: false, state: 'unavailable' };
+async function sendNotification(payload, reasonKey) {
+  if (!await ensureNotificationPermission(reasonKey)) {
+    process.stderr.write('[claude-dashboard] Notification suppressed: permission not granted\n');
+    return { ok: false, error_code: 'access_denied' };
   }
+  try {
+    const result = await hecaton.notify.send(payload);
+    if (result && result.ok === false) {
+      noteNotificationPermission(result);
+      process.stderr.write('[claude-dashboard] notify.send failed: ' + JSON.stringify(result) + '\n');
+      return result;
+    }
+    return result || { ok: true };
+  } catch (e) {
+    process.stderr.write('[claude-dashboard] notify.send failed: ' + (e.message || e) + '\n');
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+async function sendServiceRecoveryNotification() {
+  return sendNotification({
+    title: tr('Claude Service Restored'),
+    body: tr('Claude services are operational again.'),
+  }, 'permission.reason.recovery');
 }
 
 function applyServiceStatusResult(state, serviceStatus) {
@@ -1262,8 +1301,9 @@ async function main() {
   // Initial render
   rerender();
 
-  // Request notification permission before user config reads and monitoring.
-  await requestNotificationPermissionOnStartup();
+  // Ask once, up front. The first notification is raised by a background event,
+  // and a prompt opened then would land on a screen nobody is looking at.
+  await ensureNotificationPermission('permission.reason.startup');
 
   // Load config
   state.config = await loadConfig();
