@@ -160,7 +160,19 @@ const UI_CATALOGS = {
     "Sep": "Sep",
     "Oct": "Oct",
     "Nov": "Nov",
-    "Dec": "Dec"
+    "Dec": "Dec",
+    "Bookmark in terminal": "Bookmark in terminal",
+    "Bookmark terminals": "Bookmark terminals",
+    "Stop bookmarking terminals": "Stop bookmarking terminals",
+    "bookmark.tip": "Mark the scrollback where a turn ended or stopped for approval",
+    "bookmark.label": "{agent} · {message} {time}",
+    "bookmark.unsupported": "needs Hecaton API 1.21",
+    "bookmark.blocked": "bookmarks blocked",
+    "{count}s": "{count}s",
+    "bookmark.comment.when": "{message} at {time}",
+    "bookmark.comment.terminal": "Terminal: {name}",
+    "bookmark.comment.model": "Model: {model}",
+    "bookmark.comment.turn": "Turn time: {duration}"
   },
   "ko": {
     "nav.dashboard": "대시보드",
@@ -321,7 +333,19 @@ const UI_CATALOGS = {
     "Sep": "9월",
     "Oct": "10월",
     "Nov": "11월",
-    "Dec": "12월"
+    "Dec": "12월",
+    "Bookmark in terminal": "터미널에 북마크",
+    "Bookmark terminals": "터미널에 북마크 남기기",
+    "Stop bookmarking terminals": "터미널 북마크 중지",
+    "bookmark.tip": "작업이 끝나거나 승인을 기다리며 멈춘 지점을 스크롤백에 표시합니다",
+    "bookmark.label": "{agent} · {message} {time}",
+    "bookmark.unsupported": "Hecaton API 1.21 필요",
+    "bookmark.blocked": "북마크 차단됨",
+    "{count}s": "{count}초",
+    "bookmark.comment.when": "{time}에 {message}",
+    "bookmark.comment.terminal": "터미널: {name}",
+    "bookmark.comment.model": "모델: {model}",
+    "bookmark.comment.turn": "작업 시간: {duration}"
   }
 };
 // Catalogs are embedded by scripts/build.cjs; the host needs only main.js.
@@ -2250,6 +2274,8 @@ const DEFAULT_CONFIG = {
   preset: 'normal',
   notify: { ...PRESETS.normal },
   suppressDuringCompact: true,
+  // Mark the terminal's scrollback where a turn ended or stopped for approval.
+  bookmarks: true,
 };
 
 let config = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
@@ -2329,6 +2355,7 @@ async function loadConfig() {
       suppressDuringCompact: typeof parsed.suppressDuringCompact === 'boolean'
         ? parsed.suppressDuringCompact
         : DEFAULT_CONFIG.suppressDuringCompact,
+      bookmarks: typeof parsed.bookmarks === 'boolean' ? parsed.bookmarks : DEFAULT_CONFIG.bookmarks,
     };
     addLog(`Config loaded (preset: ${config.preset})`);
   } catch {
@@ -2554,6 +2581,92 @@ async function setTerminalBadge(terminalId, badge) {
 
 const CLEAR_BADGE = { label: '', icon: '', color: '', detail: '' };
 
+// ── Scrollback bookmarks ───────────────────────────────────
+// A notification says *that* a turn ended; a bookmark says *where*. The host
+// (API 1.21) drops it on the terminal's cursor row at the moment of the call,
+// which for a hook is where Claude's output stopped, and shows it on the scroll
+// map and scrollbar like a bookmark the user made by hand.
+const BOOKMARK_MESSAGE = {
+  Stop: 'response complete',
+  StopFailure: 'ended with an error',
+  PermissionRequest: 'needs permission',
+};
+const lastBookmark = new Map();
+// null = not decided yet; a string is why bookmarks are off for this run.
+let bookmarksUnavailable = null;
+// When each terminal's current turn started running, for the bookmark comment.
+const turnStartedAt = new Map();
+
+// Turns are often shorter than a minute, so unlike formatDuration this keeps seconds.
+function formatTurnDuration(ms) {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (hours > 0) return tr('{count}h', { count: hours }) + ' ' + tr('{count}m', { count: minutes });
+  if (minutes > 0) return tr('{count}m', { count: minutes }) + ' ' + tr('{count}s', { count: seconds });
+  return tr('{count}s', { count: seconds });
+}
+
+// The label stays one short line on the chip; the comment carries the details
+// you see when hovering it: exact time, terminal, model and how long the turn ran.
+function bookmarkComment(terminalId, key, info) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const d = new Date();
+  const lines = [tr('bookmark.comment.when', {
+    message: tr(BOOKMARK_MESSAGE[key]),
+    time: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
+  })];
+  lines.push(tr('bookmark.comment.terminal', { name: describeTerminal(terminalId, info.agent) }));
+  if (info.model) lines.push(tr('bookmark.comment.model', { model: info.model }));
+  const started = turnStartedAt.get(terminalId);
+  if (started) lines.push(tr('bookmark.comment.turn', { duration: formatTurnDuration(Date.now() - started) }));
+  return lines.join('\n');
+}
+
+function shouldBookmark(terminalId, key) {
+  if (!config.bookmarks || bookmarksUnavailable || !BOOKMARK_MESSAGE[key]) return false;
+  // 0 is "my own terminal" to the host — pattern matching has no real target.
+  if (!terminalId) return false;
+  const mapKey = `${terminalId}:${key}`;
+  const now = Date.now();
+  if (now - (lastBookmark.get(mapKey) || 0) < NOTIFY_DEDUPE_MS) return false;
+  lastBookmark.set(mapKey, now);
+  return true;
+}
+
+function bookmarkLabel(agent, key) {
+  const name = !agent || agent === 'claude' ? 'Claude' : agent;
+  const time = new Date().toTimeString().slice(0, 5);
+  return tr('bookmark.label', { agent: name, message: tr(BOOKMARK_MESSAGE[key]), time });
+}
+
+async function addTerminalBookmark(terminalId, agent, key, info) {
+  // Older hosts do not have the method at all; the runner builds the API from
+  // the host's own method table, so it is simply missing.
+  if (typeof hecaton.terminal?.add_bookmark !== 'function') {
+    bookmarksUnavailable = 'unsupported';
+    addLog('terminal.add_bookmark unavailable — host older than API 1.21, bookmarks off');
+    return;
+  }
+  try {
+    const r = await hecaton.terminal.add_bookmark({
+      terminal_id: terminalId,
+      label: bookmarkLabel(agent, key),
+      comment: bookmarkComment(terminalId, key, { ...info, agent }),
+    });
+    if (r && r.ok === false) {
+      // Same grant as the badge; a refusal is stored by the host, so stop asking.
+      if (r.error_code === 'access_denied') bookmarksUnavailable = 'access_denied';
+      addLog(`terminal.add_bookmark refused: ${r.error_code || r.error || 'unknown'}`);
+      if (bookmarksUnavailable) rerender();
+    }
+  } catch (e) {
+    addLog(`terminal.add_bookmark failed: ${e && e.message ? e.message : e}`);
+  }
+}
+
 sm.onTransition = async (terminalId, from, to, info) => {
   const agent = info.agent || 'unknown';
 
@@ -2561,6 +2674,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
     addLog(`[${agent}] T${terminalId} session ended`);
     lastNotify.delete(`${terminalId}:Stop`);
     compacting.delete(terminalId);
+    turnStartedAt.delete(terminalId);
     await setTerminalBadge(terminalId, CLEAR_BADGE);
     return;
   }
@@ -2578,6 +2692,15 @@ sm.onTransition = async (terminalId, from, to, info) => {
   const key = info.reason === 'pattern'
     ? (from === 'running' && to === 'waiting' ? 'Stop' : null)
     : NOTIFY_KEY_BY_EVENT[info.event];
+
+  // A turn starts when the agent starts running; an approval stop (blocked)
+  // and its resume back to running stay inside the same turn.
+  if (to === 'running' && from !== 'running' && from !== 'blocked') turnStartedAt.set(terminalId, Date.now());
+
+  // Bookmarks follow their own toggle: muting a notification should not also
+  // lose the place in the scrollback.
+  if (shouldBookmark(terminalId, key)) await addTerminalBookmark(terminalId, agent, key, info);
+  if (to !== 'running' && to !== 'blocked') turnStartedAt.delete(terminalId);
 
   if (!shouldNotify(terminalId, key)) return;
 
@@ -3017,6 +3140,21 @@ function rerender() {
     row++;
   }
 
+  {
+    const on = config.bookmarks;
+    const hot = zone(row, 3, Math.max(24, W - 2), 'toggle-bookmarks',
+      { label: tr(on ? 'Stop bookmarking terminals' : 'Bookmark terminals'),
+        tip: tr('bookmark.tip') });
+    const bg = hot ? ansi.bg.hover : '';
+    out += ansi.moveTo(row, 3) + bg + chip(on ? MARK_ON : MARK_OFF, on, false);
+    out += bg + (on ? ansi.reset + bg : ansi.dim + bg) + ' ' + tr('Bookmark in terminal') + ansi.reset;
+    if (bookmarksUnavailable) {
+      const why = tr(bookmarksUnavailable === 'unsupported' ? 'bookmark.unsupported' : 'bookmark.blocked');
+      out += bg + ansi.dim + ansi.fg.red + '  ' + why + ansi.reset;
+    }
+    row++;
+  }
+
   // ── Tracked terminals ──
   row++;
   const tracked = sm.getAll();
@@ -3212,10 +3350,15 @@ function runAction(action) {
     case 'reset-notify':
       applyPreset(DEFAULT_CONFIG.preset);
       config.suppressDuringCompact = DEFAULT_CONFIG.suppressDuringCompact;
+      config.bookmarks = DEFAULT_CONFIG.bookmarks;
       saveConfig(); rerender();
       break;
     case 'toggle-compact':
       config.suppressDuringCompact = !config.suppressDuringCompact;
+      saveConfig(); rerender();
+      break;
+    case 'toggle-bookmarks':
+      config.bookmarks = !config.bookmarks;
       saveConfig(); rerender();
       break;
     case 'clear-log':
@@ -3328,6 +3471,7 @@ hecaton.on('menu_requested', (p) => {
       })),
       { type: 'separator' },
       { id: 'toggle-compact', label: tr('Suppress during compact'), checked: config.suppressDuringCompact },
+      { id: 'toggle-bookmarks', label: tr('Bookmark in terminal'), checked: config.bookmarks },
     ],
   });
   items.push({

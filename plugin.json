@@ -3,7 +3,7 @@
   "name": "Claude Dashboard",
   "version": "1.6.0",
   "entry": "main.js",
-  "apiVersion": "1.15",
+  "apiVersion": "1.21",
   "overlay": {
     "mode": "floating",
     "width": "70%",
@@ -43,8 +43,8 @@
       "ko": "배지와 알림에 숫자 ID 대신 Claude 세션이 실행 중인 터미널 이름을 쓰기 위해 열린 터미널의 이름을 읽습니다."
     },
     "terminal_status": {
-      "en": "Show a running, waiting or blocked badge on the terminal where Claude is working, and clear that badge when the session ends.",
-      "ko": "Claude가 작업 중인 터미널에 실행 중·대기·차단 배지를 표시하고 세션이 끝나면 배지를 지웁니다."
+      "en": "Show a running, waiting or blocked badge on the terminal where Claude is working, clear that badge when the session ends, and bookmark the spot in that terminal where a turn finished or stopped for your approval.",
+      "ko": "Claude가 작업 중인 터미널에 실행 중·대기·차단 배지를 표시하고 세션이 끝나면 배지를 지우며, 작업이 끝나거나 승인을 기다리며 멈춘 지점을 그 터미널에 북마크로 남깁니다."
     },
     "cross_terminal": {
       "en": "Read the last lines drawn on the terminal screen to recognise the Claude prompt when you turn pattern matching on. This is the fallback for when hooks are unavailable and it stays off until you start it.",

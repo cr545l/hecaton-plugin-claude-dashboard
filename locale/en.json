@@ -157,5 +157,17 @@
   "Sep": "Sep",
   "Oct": "Oct",
   "Nov": "Nov",
-  "Dec": "Dec"
+  "Dec": "Dec",
+  "Bookmark in terminal": "Bookmark in terminal",
+  "Bookmark terminals": "Bookmark terminals",
+  "Stop bookmarking terminals": "Stop bookmarking terminals",
+  "bookmark.tip": "Mark the scrollback where a turn ended or stopped for approval",
+  "bookmark.label": "{agent} · {message} {time}",
+  "bookmark.unsupported": "needs Hecaton API 1.21",
+  "bookmark.blocked": "bookmarks blocked",
+  "{count}s": "{count}s",
+  "bookmark.comment.when": "{message} at {time}",
+  "bookmark.comment.terminal": "Terminal: {name}",
+  "bookmark.comment.model": "Model: {model}",
+  "bookmark.comment.turn": "Turn time: {duration}"
 }

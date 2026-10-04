@@ -157,5 +157,17 @@
   "Sep": "9월",
   "Oct": "10월",
   "Nov": "11월",
-  "Dec": "12월"
+  "Dec": "12월",
+  "Bookmark in terminal": "터미널에 북마크",
+  "Bookmark terminals": "터미널에 북마크 남기기",
+  "Stop bookmarking terminals": "터미널 북마크 중지",
+  "bookmark.tip": "작업이 끝나거나 승인을 기다리며 멈춘 지점을 스크롤백에 표시합니다",
+  "bookmark.label": "{agent} · {message} {time}",
+  "bookmark.unsupported": "Hecaton API 1.21 필요",
+  "bookmark.blocked": "북마크 차단됨",
+  "{count}s": "{count}초",
+  "bookmark.comment.when": "{time}에 {message}",
+  "bookmark.comment.terminal": "터미널: {name}",
+  "bookmark.comment.model": "모델: {model}",
+  "bookmark.comment.turn": "작업 시간: {duration}"
 }

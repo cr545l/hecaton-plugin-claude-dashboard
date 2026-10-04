@@ -330,6 +330,42 @@ test('a refused terminal badge costs the badge and nothing else', async () => {
   assert.match(h.frame(), /terminal badges blocked/);
 });
 
+test('turn boundaries bookmark the hooked terminal even when that notification is muted', async () => {
+  const h = await harness({ legacy: { version: 1, notify: { Stop: false }, suppressDuringCompact: true } });
+  await h.hook('UserPromptSubmit');
+  await h.hook('Stop');
+  await h.hook('Stop'); // duplicate inside the dedupe window
+  await h.hook('PermissionRequest');
+  const marks = h.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.deepEqual(marks.map(c => c.args.terminal_id), [42, 42]);
+  assert.match(marks[0].args.label, /^Claude · response complete \d\d:\d\d$/);
+  assert.match(marks[1].args.label, /needs permission/);
+  // The comment carries what the one-line label cannot: exact time, terminal and turn length.
+  const lines = marks[0].args.comment.split('\n');
+  assert.match(lines[0], /^response complete at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+  assert.equal(lines[1], 'Terminal: test project');
+  assert.match(marks[0].args.comment, /Turn time: \d+s/);
+  assert.doesNotMatch(marks[1].args.comment, /Turn time/, 'the turn ended at Stop; the next one has not started');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 0, 'neither event notifies with these settings');
+});
+
+test('bookmarks can be turned off and a refusal stops further requests', async () => {
+  const off = await harness();
+  await off.input('a');
+  await off.emit('menu_activated', { id: 'toggle-bookmarks' });
+  await off.hook('Stop');
+  assert.equal(off.calls.filter(c => c.method === 'terminal.add_bookmark').length, 0);
+  assert.equal(JSON.parse(off.files.get('/home/.hecaton/data/dev.hecaton.claude-dashboard/agent-state.json')).bookmarks, false);
+
+  const denied = await harness({ deny: ['terminal.add_bookmark'] });
+  await denied.hook('Stop');
+  await denied.hook('PermissionRequest');
+  assert.equal(denied.calls.filter(c => c.method === 'terminal.add_bookmark').length, 1, 'one refusal is not re-asked');
+  assert.equal(denied.calls.filter(c => c.method === 'notify.send').length, 1, 'notifications are a separate grant');
+  await denied.input('a');
+  assert.match(denied.frame(), /bookmarks blocked/);
+});
+
 test('pattern matching turns itself back off when screen access is refused', async () => {
   const h = await harness({ deny: ['terminal.subscribe'] });
   await h.input('a');
