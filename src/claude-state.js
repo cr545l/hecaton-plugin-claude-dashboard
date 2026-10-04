@@ -2,10 +2,17 @@
 function createClaudeState(host, options) {
 let visible = false;
 let disposed = false;
+const sharedUI = !options.service;
+let serviceChannel = null;
+let connectedBefore = false;
+let serviceError = null;
+let remoteNotificationBlocked = false;
+const backgroundEvents = new Set(['ws_connected', 'ws_message_received', 'ws_disconnected', 'http_request_received', 'terminal_changed']);
 const uiEvents = new Set(['mouse_event', 'menu_requested', 'menu_activated']);
 const hecaton = new Proxy(host, {
   get(target, key) {
     if (key === 'on') return (event, handler) => target.on(event, params => {
+      if (sharedUI && backgroundEvents.has(event)) return;
       if (disposed || (uiEvents.has(event) && !visible)) return;
       return handler(params);
     });
@@ -295,7 +302,6 @@ async function initLogFile() {
     const base = home && (home.path || home.value);
     if (!base) return;
     logFilePath = `${base}/.claude/hecaton-agent-state.log`;
-    serverIdFile = `${base}/.claude/hecaton-agent-state.server`;
     addLog(`=== plugin start (port ${PORT}) — log: ${logFilePath}`);
   } catch { /* ignore */ }
 }
@@ -386,6 +392,7 @@ let termRows = parseInt(hecaton.initialState?.rows || '24', 10);
 const PORT = 9218;
 let serverId = null;
 let serverRunning = false;
+let serverError = null;
 let patternEnabled = false;
 let subscriptionId = null;
 // Set once terminal_status is refused: the badge is optional decoration, and
@@ -482,6 +489,58 @@ function isCompacting(terminalId) {
 // State Machine
 // ============================================================
 const sm = new AgentStateMachine();
+
+function snapshot() {
+  return { config, serverRunning, serverError, patternEnabled, badgesBlocked, bookmarksUnavailable,
+    terminals: sm.getAll(), terminalInfo: [...terminalInfo], connections: [...connections],
+    compacting: [...compacting], log: log.slice(), logFilePath, configFile,
+    notificationBlocked: notificationsBlocked() };
+}
+
+function applySnapshot(data) {
+  if (disposed || !data) return;
+  serviceError = null;
+  config = data.config;
+  serverRunning = data.serverRunning;
+  serverError = data.serverError;
+  patternEnabled = data.patternEnabled;
+  badgesBlocked = data.badgesBlocked;
+  bookmarksUnavailable = data.bookmarksUnavailable;
+  sm.terminals = new Map(data.terminals.map(({ id, ...value }) => [id, value]));
+  for (const [map, entries] of [[terminalInfo, data.terminalInfo], [connections, data.connections], [compacting, data.compacting]]) {
+    map.clear();
+    for (const [key, value] of entries) map.set(key, value);
+  }
+  log.splice(0, log.length, ...data.log);
+  logFilePath = data.logFilePath;
+  configFile = data.configFile;
+  remoteNotificationBlocked = data.notificationBlocked;
+  rerender();
+}
+
+async function serviceRequest(method = 'status', params = {}) {
+  if (disposed) return;
+  try {
+    if (!serviceChannel) {
+      if (typeof host.serviceChannel !== 'function') throw new Error('service_unsupported');
+      serviceChannel = host.serviceChannel({
+        protocol: 1, reason: translations('permission.reason.service'),
+        onNotify: (method, data) => { if (method === 'state') applySnapshot(data); },
+        onConnected: () => { if (connectedBefore) serviceRequest(); },
+        onDisconnected: () => { serviceError = 'service_disconnected'; serverRunning = false; rerender(); },
+      });
+    }
+    await serviceChannel.connect();
+    if (disposed) { await serviceChannel.close(); return; }
+    connectedBefore = true;
+    applySnapshot(await serviceChannel.request(method, params, 120000));
+  } catch (e) {
+    if (disposed) return;
+    serviceError = [e.code, e.message].filter(Boolean).join(': ');
+    serverRunning = false;
+    addLog('Background service: ' + serviceError);
+  }
+}
 
 const STATE_COLORS = {
   running: '#50FA7B',   // green
@@ -687,6 +746,7 @@ sm.onTransition = async (terminalId, from, to, info) => {
 
   const body = (NOTIFY_BODY[key] || NOTIFY_BODY.Stop)(describeTerminal(terminalId, agent));
   await sendNotification({ terminal_id: terminalId, title: tr('Claude State'), body }, 'permission.reason.agent');
+  rerender();
 };
 
 // ============================================================
@@ -835,59 +895,28 @@ async function onTerminalChanged(params) {
 // ============================================================
 // WebSocket/HTTP server
 // ============================================================
-// The host owns the listening socket, not this process. If the plugin is killed
-// rather than quit — window closed, reloaded, crashed — cleanup never runs and
-// that socket stays bound. A second listener on the same port then wins the
-// accept queue on Windows and every hook request vanishes into the dead one,
-// which is silent and looks exactly like "hooks stopped firing".
-//
-// So the server_id is written to disk and reclaimed on the next start. It costs
-// one stop() call and removes the whole failure mode.
-let serverIdFile = null;
-
-async function reclaimPreviousServer() {
-  if (!serverIdFile) return;
-  let prev = null;
-  try {
-    const r = await hecaton.fs.read_file({ path: serverIdFile });
-    prev = r && r.content ? String(r.content).trim() : null;
-  } catch { return; }
-  if (!prev) return;
-  try {
-    const asNum = Number(prev);
-    await hecaton.web.stop({ server_id: Number.isFinite(asNum) ? asNum : prev });
-    addLog(`Reclaimed leaked server ${prev}`);
-  } catch (e) {
-    addLog(`Could not reclaim server ${prev}: ${e && e.message ? e.message : e}`);
-  }
-}
-
-async function rememberServer(id) {
-  if (!serverIdFile || id === undefined || id === null) return;
-  try {
-    await hecaton.fs.write_file({ path: serverIdFile, content: String(id) });
-  } catch { /* best effort */ }
-}
-
+// The shared service owns its listener; server ids cannot be reclaimed by another instance.
 async function startServer() {
   if (serverRunning) return;
+  serverError = null;
   addLog(`Starting Claude State server on port ${PORT}...`);
 
-  await reclaimPreviousServer();
 
-  const result = await hecaton.web.serve({ port: PORT, host: '127.0.0.1' });
+  let result;
+  try { result = await hecaton.web.serve({ port: PORT, host: '127.0.0.1' }); }
+  catch (e) { result = { ok: false, error: e.message || String(e) }; }
   if (disposed) {
     if (result?.ok) await hecaton.web.stop({ server_id: result.server_id });
     return;
   }
   if (!result || !result.ok) {
-    addLog(`Server failed: ${result?.error || 'unknown'}`);
+    serverError = result?.error_code || result?.error || 'unknown';
+    addLog(`Server failed: ${serverError}`);
     return;
   }
 
   serverId = result.server_id;
   serverRunning = true;
-  await rememberServer(serverId);
   addLog(`Server running on ws://127.0.0.1:${result.port} (id ${serverId})`);
 
   await hecaton.web.set_http({
@@ -904,7 +933,6 @@ async function stopServer() {
   if (serverId !== null) {
     await hecaton.web.stop({ server_id: serverId });
     serverId = null;
-    await rememberServer('');
   }
   connections.clear();
   serverRunning = false;
@@ -961,6 +989,7 @@ let logFilePath = null;
 let logFlushTimer = null;
 
 function scheduleLogFlush() {
+  if (sharedUI) return;
   if (!logFilePath || logFlushTimer) return;
   logFlushTimer = setTimeout(async () => {
     logFlushTimer = null;
@@ -1022,6 +1051,10 @@ function button(label, hot, tone) {
 }
 
 function rerender() {
+  if (options.service) {
+    if (!disposed) options.onChange?.(snapshot());
+    return;
+  }
   if (disposed || !visible) return;
   if (minimized) return;
 
@@ -1044,7 +1077,9 @@ function rerender() {
     out += (markHot ? ansi.bg.hover : '') + tr('  Hook Server  ') + ansi.reset;
 
     out += ansi.moveTo(row, 19) + ansi.dim;
-    out += serverRunning ? tr('{port} · {count} clients', { port: PORT, count: connections.size }) : tr('stopped');
+    out += serviceError ? tr(serviceError.includes('no_service') ? 'service.noService' : 'service.failed')
+      : serverError ? tr('service.serverFailed', { port: PORT })
+      : serverRunning ? tr('{port} · {count} clients', { port: PORT, count: connections.size }) : tr('stopped');
     out += ansi.reset;
 
     const btnHot = zone(row, btnCol, btnCol + displayWidth(btnLabel) + 3, 'toggle-server',
@@ -1088,7 +1123,7 @@ function rerender() {
 
     // A screen of notification toggles is a lie once the host has refused the
     // permission — say so where the toggles are.
-    if (notificationsBlocked()) {
+    if (sharedUI ? remoteNotificationBlocked : notificationsBlocked()) {
       const warn = clipCells(tr('permission.notify.blocked'), Math.max(0, Math.max(24, W - 11) - 22));
       out += ansi.moveTo(row, 21) + ansi.fg.red + warn + ansi.reset;
     }
@@ -1244,6 +1279,7 @@ hecaton.on('locale_changed', (params) => {
   setUiLocale(params?.locale);
   appliedTooltip = null;
   rerender();
+  if (sharedUI) return;
   for (const terminal of sm.getAll()) {
     const detail = terminal.model ? `${terminal.model} (${tr(terminal.state)})` : tr(terminal.state);
     setTerminalBadge(terminal.id, {
@@ -1287,15 +1323,27 @@ hecaton.on('window_restored', () => {
 // Actions — every control resolves to one of these, whether it was
 // clicked, picked from the context menu, or typed as a shortcut.
 // ============================================================
-function runAction(action) {
+async function runAction(action) {
   if (!action || action === 'log-area') return;
+  const local = ['dashboard', 'install-hooks', 'open-log-file', 'quit'];
+  if (sharedUI && !local.includes(action)) {
+    if (serviceError && action === 'toggle-server') { await serviceRequest(); return; }
+    await serviceRequest('action', { action });
+    return;
+  }
+  if (options.service && local.includes(action)) return;
+  if (action.startsWith('preset-set:')) {
+    applyPreset(action.slice(11));
+    await saveConfig(); rerender();
+    return;
+  }
 
   if (action.startsWith('notify:')) {
     const key = action.slice(7);
     const idx = NOTIFY_EVENTS.findIndex(e => e.key === key);
     if (idx === -1) return;
     toggleNotifyEvent(idx);
-    saveConfig();
+    await saveConfig();
     rerender();
     return;
   }
@@ -1314,33 +1362,33 @@ function runAction(action) {
     case 'dashboard': options.onBack(); break;
     case 'install-hooks': checkAndInjectHooks(); break;
     case 'toggle-server':
-      if (serverRunning) stopServer(); else startServer();
+      if (serverRunning) await stopServer(); else await startServer();
       break;
     case 'toggle-pattern':
-      if (patternEnabled) stopPatternMatching(); else startPatternMatching();
+      if (patternEnabled) await stopPatternMatching(); else await startPatternMatching();
       break;
     case 'preset-next':
-      cyclePreset(); saveConfig(); rerender();
+      cyclePreset(); await saveConfig(); rerender();
       break;
     case 'preset-prev': {
       const i = PRESET_ORDER.indexOf(config.preset);
       const prev = i <= 0 ? PRESET_ORDER[PRESET_ORDER.length - 1] : PRESET_ORDER[i - 1];
-      applyPreset(prev); saveConfig(); rerender();
+      applyPreset(prev); await saveConfig(); rerender();
       break;
     }
     case 'reset-notify':
       applyPreset(DEFAULT_CONFIG.preset);
       config.suppressDuringCompact = DEFAULT_CONFIG.suppressDuringCompact;
       config.bookmarks = DEFAULT_CONFIG.bookmarks;
-      saveConfig(); rerender();
+      await saveConfig(); rerender();
       break;
     case 'toggle-compact':
       config.suppressDuringCompact = !config.suppressDuringCompact;
-      saveConfig(); rerender();
+      await saveConfig(); rerender();
       break;
     case 'toggle-bookmarks':
       config.bookmarks = !config.bookmarks;
-      saveConfig(); rerender();
+      await saveConfig(); rerender();
       break;
     case 'clear-log':
       log.length = 0; logScroll = 0; rerender();
@@ -1472,12 +1520,6 @@ hecaton.on('menu_requested', (p) => {
 
 hecaton.on('menu_activated', (p) => {
   const id = p.id || '';
-  if (id.startsWith('preset-set:')) {
-    applyPreset(id.slice(11));
-    saveConfig();
-    rerender();
-    return;
-  }
   runAction(id);
 });
 
@@ -1731,12 +1773,18 @@ async function performHookInstall() {
 // The dashboard owns stdin, rendering and process lifetime.
 return {
   async start() {
+    if (sharedUI) {
+      await serviceRequest();
+      if (!disposed && serverRunning) await checkAndInjectHooks();
+      return;
+    }
     for (const init of [initLogFile, loadConfig, refreshTerminalInfo, startServer]) {
       if (disposed) return;
       try { await init(); } catch (e) { addLog(`Initialization: ${e.message || e}`); }
     }
-    if (!disposed && serverRunning) await checkAndInjectHooks();
   },
+  snapshot,
+  action: runAction,
   show(value) {
     visible = value;
     if (value) panelScroll = 0;
@@ -1749,18 +1797,22 @@ return {
   render: rerender,
   input: handleInput,
   // Closing stdin prevents RPC replies, so issue all release requests before exit.
-  dispose() {
+  async dispose() {
     if (disposed) return;
     disposed = true;
     clearTimeout(logFlushTimer);
-    const release = action => { try { Promise.resolve(action()).catch(() => {}); } catch {} };
+    if (sharedUI) {
+      if (serviceChannel) await serviceChannel.close();
+      return;
+    }
+    const pending = [];
+    const release = action => { try { pending.push(Promise.resolve(action()).catch(() => {})); } catch {} };
     if (serverId !== null) release(() => host.web.stop({ server_id: serverId }));
     if (subscriptionId !== null) release(() => host.terminal.unsubscribe({ subscription_id: subscriptionId }));
     for (const t of sm.getAll()) {
       release(() => host.terminal.set_status({ terminal_id: t.id, label: '', icon: '', color: '', detail: '' }));
     }
-    release(() => host.window.set_cursor({ cursor: 'default' }));
-    release(() => host.window.set_tooltip({ text: '' }));
+    await Promise.allSettled(pending);
   },
 };
 }

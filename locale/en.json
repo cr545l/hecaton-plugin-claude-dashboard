@@ -1,4 +1,8 @@
 {
+  "permission.reason.service": "Share one background service for hooks, agent state, bookmarks and notifications. Keep it alive for up to 10 minutes after the last window closes.",
+  "service.noService": "Service unregistered: close and reopen this window",
+  "service.failed": "Service connection failed; Start to retry",
+  "service.serverFailed": "Port {port} failed; Start to retry",
   "nav.dashboard": "Dashboard",
   "nav.agents": "Agent State",
   "nav.activity": "Activity",

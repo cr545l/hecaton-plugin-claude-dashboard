@@ -5,10 +5,14 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const root = path.resolve(__dirname, '..');
-const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(setImmediate); };
+const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(setImmediate); };
 
-async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200, permission = 'granted', notifySend, deny = [] } = {}) {
+async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200, permission = 'granted', notifySend, deny = [], serviceFailure } = {}) {
   const events = new EventEmitter();
+  const serviceEvents = new EventEmitter();
+  let serviceHandlers, serviceShutdown;
+  const clients = new Set();
+  const clone = value => JSON.parse(JSON.stringify(value));
   const stdin = new EventEmitter();
   Object.assign(stdin, { resume() {}, setEncoding() {}, isTTY: false });
   const calls = [], output = [], files = new Map(), timers = new Map();
@@ -18,6 +22,15 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
   if (legacy) files.set('/home/.hecaton/data/dev.hecaton.claude-hook/config.json', JSON.stringify(legacy));
   files.set('/home/.claude/settings.json', JSON.stringify({ existing: true, hooks: {} }));
   const host = new Proxy({
+    serviceChannel: options => {
+      const channel = {
+        connected: false,
+        connect: async () => { if (serviceFailure) throw Object.assign(new Error(serviceFailure), { code: serviceFailure }); if (!channel.connected) { channel.connected = true; clients.add(options); options.onConnected?.(); } },
+        request: async (method, params) => clone(await serviceHandlers.onRequest(1, method, params)),
+        close: async () => { channel.connected = false; clients.delete(options); },
+      };
+      return channel;
+    },
     initialState: { cols, rows: 40, minimized: false, locale },
     on: (name, fn) => events.on(name, fn),
   }, {
@@ -62,14 +75,63 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
   const context = vm.createContext({ hecaton: host, process: proc, __dirname: root, console, atob,
     setTimeout: fn => { timers.set(++timer, fn); return timer; }, clearTimeout: id => timers.delete(id),
   });
+  const serviceApi = new Proxy(host, { get: (target, key) => {
+    if (key === 'on') return (name, fn) => serviceEvents.on(name, fn);
+    if (key === 'onShutdown') return fn => { serviceShutdown = fn; };
+    if (key === 'serviceHost') return handlers => {
+      serviceHandlers = handlers;
+      return { listen: async () => {}, broadcast: async (method, data) => {
+        for (const client of clients) client.onNotify(method, clone(data));
+      } };
+    };
+    return target[key];
+  } });
+  const serviceContext = vm.createContext({ hecaton: serviceApi, process: { ...proc, stdout: { write: () => assert.fail('service must not render') } }, __dirname: root, console, atob,
+    setTimeout: fn => { timers.set(++timer, fn); return timer; }, clearTimeout: id => timers.delete(id) });
+  await new vm.Script(`(async () => {${fs.readFileSync(path.join(root, 'service.js'), 'utf8').replace(/^#![^\n]*\n/, '')}})()`).runInContext(serviceContext);
   const source = fs.readFileSync(path.join(root, 'main.js'), 'utf8').replace(/^#![^\n]*\n/, '');
   const textHelpers = await new vm.Script(`(async () => {${source}\nreturn { displayWidth, clipCells };})()`).runInContext(context);
   await flush();
-  const emit = async (name, data) => { events.emit(name, data); await flush(); };
+  const emit = async (name, data) => { events.emit(name, data); if (['http_request_received', 'ws_connected', 'ws_message_received', 'ws_disconnected', 'terminal_changed', 'locale_changed'].includes(name)) serviceEvents.emit(name, data); await flush(); };
   const input = async key => { stdin.emit('data', key); await flush(); };
   const hook = async event => emit('http_request_received', { method: 'POST', path: '/hook', body: JSON.stringify({ client: 'claude', terminal_id: 42, event }) });
-  return { calls, output, files, emit, input, hook, stdin, timers, textHelpers, setPermission: next => { permissionState = next; }, frame: () => output.join('').split('\x1b[2J').at(-1) };
+  return { calls, output, files, emit, input, hook, stdin, timers, textHelpers, connectClient: options => host.serviceChannel(options), shutdownService: () => serviceShutdown(), serviceHandlers, setPermission: next => { permissionState = next; }, frame: () => output.join('').split('\x1b[2J').at(-1) };
 }
+
+test('reopening and multiple clients share state, settings and a single listener', async () => {
+  const h = await harness();
+  await h.hook('UserPromptSubmit');
+  h.stdin.emit('end');
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1);
+  assert.equal(h.calls.filter(c => c.method === 'web.stop').length, 0);
+  const updates = [];
+  const reopened = h.connectClient({ onNotify: (_method, data) => updates.push(data) });
+  const other = h.connectClient({ onNotify() {} });
+  await reopened.connect();
+  await other.connect();
+  const state = await reopened.request('status');
+  assert.equal(state.terminals[0].state, 'waiting');
+  await other.request('action', { action: 'toggle-bookmarks' });
+  assert.equal(updates.at(-1).config.bookmarks, false);
+  assert.equal(h.calls.filter(c => c.method === 'web.serve').length, 1);
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1);
+  await reopened.close();
+  await other.close();
+  assert.equal(h.calls.filter(c => c.method === 'web.stop').length, 0);
+  await h.shutdownService();
+  assert.equal(h.calls.filter(c => c.method === 'web.stop').length, 1);
+});
+
+test('service registration and permission failures never start a competing UI server', async () => {
+  for (const serviceFailure of ['no_service', 'permission_denied']) {
+    const h = await harness({ serviceFailure });
+    await h.input('a');
+    assert.equal(h.calls.filter(c => c.method === 'web.serve').length, 0);
+    assert.match(h.frame(), serviceFailure === 'no_service' ? /close and reopen/ : /Service connection failed/);
+  }
+});
 
 test('background hooks update badges and notify without overwriting dashboard', async () => {
   const h = await harness();
@@ -149,13 +211,17 @@ test('hook installation preserves settings changed while the dialog was open', a
   assert.equal(Object.keys(settings.hooks).length, 9);
 });
 
-test('shutdown releases server, subscription and badges once without awaiting closed stdin', async () => {
+test('UI shutdown preserves server and badges; service shutdown releases them once', async () => {
   const h = await harness();
   await h.input('a');
   await h.input('p');
   await h.hook('UserPromptSubmit');
   h.stdin.emit('end');
   h.stdin.emit('close');
+  assert.equal(h.calls.filter(c => c.method === 'web.stop').length, 0);
+  assert.equal(h.calls.filter(c => c.method === 'terminal.unsubscribe').length, 0);
+  await h.shutdownService();
+  await h.shutdownService();
   assert.equal(h.calls.filter(c => c.method === 'web.stop').length, 1);
   assert.equal(h.calls.filter(c => c.method === 'terminal.unsubscribe').length, 1);
   assert.equal(h.calls.filter(c => c.method === 'terminal.set_status').at(-1).args.label, '');
@@ -165,8 +231,10 @@ test('shutdown during server startup releases the late server', async () => {
   let resolve;
   const h = await harness({ serve: () => new Promise(r => { resolve = r; }) });
   h.stdin.emit('end');
+  const shutdown = h.shutdownService();
   resolve({ ok: true, server_id: 88, port: 9218 });
   await flush();
+  await shutdown;
   assert.equal(h.calls.find(c => c.method === 'web.stop').args.server_id, 88);
   assert.equal(h.calls.filter(c => c.method === 'dialog.show').length, 0);
 });

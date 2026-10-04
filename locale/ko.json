@@ -1,4 +1,8 @@
 {
+  "permission.reason.service": "훅 서버와 에이전트 상태·북마크·알림을 하나의 백그라운드 서비스에서 처리합니다. 마지막 창을 닫은 뒤 최대 10분간 유지합니다.",
+  "service.noService": "서비스 미등록: 창을 닫고 새로 여세요",
+  "service.failed": "서비스 연결 실패 · 시작으로 재시도",
+  "service.serverFailed": "{port} 포트 시작 실패 · 시작으로 재시도",
   "nav.dashboard": "대시보드",
   "nav.agents": "에이전트 상태",
   "nav.activity": "활동 기록",

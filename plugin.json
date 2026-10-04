@@ -3,6 +3,7 @@
   "name": "Claude Dashboard",
   "version": "1.6.0",
   "entry": "main.js",
+  "service": { "entry": "service.js", "idle_timeout_ms": 600000 },
   "apiVersion": "1.21",
   "overlay": {
     "mode": "floating",
