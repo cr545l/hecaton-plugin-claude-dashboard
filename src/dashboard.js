@@ -1225,11 +1225,42 @@ async function main() {
     setTooltip('');
     rerender();
   });
-  const agentState = createClaudeState(hecaton, {
+  // Window state is subscribed before anything else, including the agent view
+  // created below: the runner replays a notification that arrived during the
+  // startup awaits to its first subscriber only, and missing a startup
+  // window_minimized here leaves the full dashboard drawn into the minimized bar.
+  // The replay runs inside hecaton.on, so the agent view may not exist yet.
+  let agentState = null;
+  hecaton.on('window_resized', (params) => {
+    termCols = params.cols || termCols;
+    termRows = params.rows || termRows;
+    agentState?.resize(termCols, termRows);
+    rerender();
+  });
+  hecaton.on('window_minimized', () => {
+    state.minimized = true;
+    agentState?.setMinimized(true);
+    agentState?.show(false);
+    renderMinimized(state);
+  });
+  // Maximizing takes the window's single state slot, so it also ends minimized.
+  for (const event of ['window_restored', 'window_maximized']) {
+    hecaton.on(event, () => {
+      if (event === 'window_maximized' && !state.minimized) return;
+      state.minimized = false;
+      agentState?.setMinimized(false);
+      agentState?.show(state.agentView);
+      setTooltip('');
+      rerender();
+    });
+  }
+  agentState = createClaudeState(hecaton, {
     onBack: () => selectView(0),
     renderNavigation: () => renderNavigation(state),
     onClose: () => { cleanup(); hecaton.window.close().catch(() => {}); },
   });
+  agentState.resize(termCols, termRows);
+  agentState.setMinimized(state.minimized);
   function selectView(view) {
     state.agentView = view === 1;
     state.heatmapView = view === 2;
@@ -1361,23 +1392,6 @@ async function main() {
   } catch { /* ignore if not a TTY */ }
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
-
-  hecaton.on('window_resized', (params) => {
-    termCols = params.cols || termCols;
-    termRows = params.rows || termRows;
-    rerender();
-  });
-  hecaton.on('window_minimized', () => {
-    state.minimized = true;
-    agentState.show(false);
-    renderMinimized(state);
-  });
-  hecaton.on('window_restored', () => {
-    state.minimized = false;
-    agentState.show(state.agentView);
-    setTooltip('');
-    rerender();
-  });
 
   process.stdin.on('data', (key) => {
     if (!state.minimized) {

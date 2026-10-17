@@ -1703,11 +1703,42 @@ async function main() {
     setTooltip('');
     rerender();
   });
-  const agentState = createClaudeState(hecaton, {
+  // Window state is subscribed before anything else, including the agent view
+  // created below: the runner replays a notification that arrived during the
+  // startup awaits to its first subscriber only, and missing a startup
+  // window_minimized here leaves the full dashboard drawn into the minimized bar.
+  // The replay runs inside hecaton.on, so the agent view may not exist yet.
+  let agentState = null;
+  hecaton.on('window_resized', (params) => {
+    termCols = params.cols || termCols;
+    termRows = params.rows || termRows;
+    agentState?.resize(termCols, termRows);
+    rerender();
+  });
+  hecaton.on('window_minimized', () => {
+    state.minimized = true;
+    agentState?.setMinimized(true);
+    agentState?.show(false);
+    renderMinimized(state);
+  });
+  // Maximizing takes the window's single state slot, so it also ends minimized.
+  for (const event of ['window_restored', 'window_maximized']) {
+    hecaton.on(event, () => {
+      if (event === 'window_maximized' && !state.minimized) return;
+      state.minimized = false;
+      agentState?.setMinimized(false);
+      agentState?.show(state.agentView);
+      setTooltip('');
+      rerender();
+    });
+  }
+  agentState = createClaudeState(hecaton, {
     onBack: () => selectView(0),
     renderNavigation: () => renderNavigation(state),
     onClose: () => { cleanup(); hecaton.window.close().catch(() => {}); },
   });
+  agentState.resize(termCols, termRows);
+  agentState.setMinimized(state.minimized);
   function selectView(view) {
     state.agentView = view === 1;
     state.heatmapView = view === 2;
@@ -1839,23 +1870,6 @@ async function main() {
   } catch { /* ignore if not a TTY */ }
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
-
-  hecaton.on('window_resized', (params) => {
-    termCols = params.cols || termCols;
-    termRows = params.rows || termRows;
-    rerender();
-  });
-  hecaton.on('window_minimized', () => {
-    state.minimized = true;
-    agentState.show(false);
-    renderMinimized(state);
-  });
-  hecaton.on('window_restored', () => {
-    state.minimized = false;
-    agentState.show(state.agentView);
-    setTooltip('');
-    rerender();
-  });
 
   process.stdin.on('data', (key) => {
     if (!state.minimized) {
@@ -2710,6 +2724,105 @@ function bookmarkLabel(agent, key) {
   return tr('bookmark.label', { agent: name, message: tr(BOOKMARK_MESSAGE[key]), time });
 }
 
+// ── Locating the turn on screen ──
+// The cursor row is the wrong place for a turn-end bookmark: when the hook
+// fires, Claude Code parks the cursor in its input box, a region Ink redraws
+// on every frame (it still shows "running Stop hooks…" at that point), so the
+// row soon holds the footer or the next turn. Reading the screen lets the
+// bookmark cover the turn's final reply, every line of it:
+//   ❯ prompt…
+//   ⏺ Bash(…)                ← tool calls of the same turn are left out
+//     ⎿  …
+//   ⏺ reply…                 ← start: the last message (column 0; its lines are indented)
+//     …last line             ← end
+//   ✻ Brewed for 3s · done   ← written once the turn has settled
+//   ──────────               ← input box: everything below is redrawn
+//   ❯ |                      ← cursor
+// Only the visible screen can be read, so a reply taller than the screen is
+// marked from the top row down.
+const LOCATE_EVENTS = new Set(['Stop', 'StopFailure']);
+const LOCATE_RETRY_MS = 150;
+const LOCATE_ATTEMPTS = 7;
+const RULE_RE = /^─{20,}$/;
+// The settled line has a past-tense verb; the live spinner's ends in "…".
+const DONE_RE = /^[✻✽✢✳✶*·] [^\s…]+ for \d/;
+const PROMPT_RE = /^[❯>] /;
+// Windows builds of Claude Code draw the message bullet as ●.
+const MESSAGE_RE = /^[⏺●] /;
+// null = not decided yet; a string is why screen reads are off for this run.
+let screenReadUnavailable = null;
+
+// Each cell is 12 bytes and starts with its UTF-32 LE code point. The host
+// sends each row as a base64 string.
+function decodeRow(entry, cols) {
+  const data = typeof entry === 'string' ? entry : entry && entry.data;
+  if (!data) return '';
+  const raw = atob(data);
+  let text = '';
+  for (let c = 0; c < cols; c++) {
+    const offset = c * 12;
+    if (offset + 4 > raw.length) break;
+    const cp = raw.charCodeAt(offset)
+      | (raw.charCodeAt(offset + 1) << 8)
+      | (raw.charCodeAt(offset + 2) << 16)
+      | (raw.charCodeAt(offset + 3) << 24);
+    text += cp > 0 ? String.fromCodePoint(cp) : ' ';
+  }
+  return text.trimEnd();
+}
+
+// Returns null when the screen does not look like Claude Code, settled:false
+// while the turn is still being drawn, else the turn's screen rows.
+function locateTurn(lines, cursorY) {
+  let rule = -1;
+  for (let r = Math.min(cursorY, lines.length - 1); r >= 0 && r >= cursorY - 10; r--) {
+    if (RULE_RE.test(lines[r])) { rule = r; break; }
+  }
+  if (rule < 0) return null;
+  let r = rule - 1;
+  while (r >= 0 && !lines[r].trim()) r--;
+  if (r < 0 || !DONE_RE.test(lines[r])) return { settled: false };
+  r--;
+  while (r >= 0 && !lines[r].trim()) r--;
+  if (r < 0) return null;
+  const end = r;
+  for (let s = end; s >= 0; s--) {
+    if (MESSAGE_RE.test(lines[s])) return { settled: true, start: s, end };
+    // A prompt or an earlier turn's end with no bullet in between: not a reply
+    // we recognise, so mark only the line we are sure of.
+    if (PROMPT_RE.test(lines[s]) || DONE_RE.test(lines[s])) return { settled: true, start: end, end };
+  }
+  // The reply starts above the screen.
+  return { settled: true, start: 0, end, clipped: true };
+}
+
+// Bookmark placement relative to the cursor, or null to fall back to the cursor row.
+async function locateBookmark(terminalId) {
+  if (screenReadUnavailable || typeof hecaton.terminal?.get_cells !== 'function') return null;
+  for (let attempt = 0; attempt < LOCATE_ATTEMPTS; attempt++) {
+    if (attempt) await new Promise(resolve => setTimeout(resolve, LOCATE_RETRY_MS));
+    const cells = await hecaton.terminal.get_cells({ terminal_id: terminalId, since_version: 0 });
+    if (cells && cells.ok === false) {
+      // Another terminal's screen needs cross_terminal; the host stores a refusal.
+      if (cells.error_code === 'access_denied') screenReadUnavailable = 'access_denied';
+      addLog(`terminal.get_cells T${terminalId} refused: ${cells.error_code || cells.error || 'unknown'} — bookmark at cursor`);
+      return null;
+    }
+    if (!cells || !cells.rows_data || typeof cells.cursor_y !== 'number') return null;
+    const lines = [];
+    for (let row = 0; row < cells.rows; row++) lines.push(decodeRow(cells.rows_data[row], cells.cols));
+    const turn = locateTurn(lines, cells.cursor_y);
+    if (!turn) return null;
+    if (turn.settled) {
+      const count = turn.end - turn.start + 1;
+      addLog(`T${terminalId} bookmark covers ${count} line(s)${turn.clipped ? ' from the screen top' : ''}`);
+      return { row_offset: turn.start - cells.cursor_y, lines: count };
+    }
+  }
+  addLog(`T${terminalId} turn end never settled on screen — bookmark at cursor`);
+  return null;
+}
+
 async function addTerminalBookmark(terminalId, agent, key, info) {
   // Older hosts do not have the method at all; the runner builds the API from
   // the host's own method table, so it is simply missing.
@@ -2718,12 +2831,17 @@ async function addTerminalBookmark(terminalId, agent, key, info) {
     addLog('terminal.add_bookmark unavailable — host older than API 1.21, bookmarks off');
     return;
   }
+  // Built before locating: the turn's start time is dropped once this returns control.
+  const label = bookmarkLabel(agent, key);
+  const comment = bookmarkComment(terminalId, key, { ...info, agent });
   try {
-    const r = await hecaton.terminal.add_bookmark({
-      terminal_id: terminalId,
-      label: bookmarkLabel(agent, key),
-      comment: bookmarkComment(terminalId, key, { ...info, agent }),
-    });
+    let placement = null;
+    try {
+      if (LOCATE_EVENTS.has(key)) placement = await locateBookmark(terminalId);
+    } catch (e) {
+      addLog(`T${terminalId} screen read failed: ${e && e.message ? e.message : e}`);
+    }
+    const r = await hecaton.terminal.add_bookmark({ terminal_id: terminalId, label, comment, ...placement });
     if (r && r.ok === false) {
       // Same grant as the badge; a refusal is stored by the host, so stop asking.
       if (r.error_code === 'access_denied') bookmarksUnavailable = 'access_denied';
@@ -2766,8 +2884,9 @@ sm.onTransition = async (terminalId, from, to, info) => {
   if (to === 'running' && from !== 'running' && from !== 'blocked') turnStartedAt.set(terminalId, Date.now());
 
   // Bookmarks follow their own toggle: muting a notification should not also
-  // lose the place in the scrollback.
-  if (shouldBookmark(terminalId, key)) await addTerminalBookmark(terminalId, agent, key, info);
+  // lose the place in the scrollback. Not awaited: placing it can wait for the
+  // screen to settle, and the notification should not wait with it.
+  if (shouldBookmark(terminalId, key)) addTerminalBookmark(terminalId, agent, key, info);
   if (to !== 'running' && to !== 'blocked') turnStartedAt.delete(terminalId);
 
   if (!shouldNotify(terminalId, key)) return;
@@ -2886,22 +3005,7 @@ async function onTerminalChanged(params) {
 
     const lines = [];
     const startRow = Math.max(0, rows - 10);
-    for (let r = startRow; r < rows; r++) {
-      const rowEntry = rowsData[r];
-      if (!rowEntry || !rowEntry.data) { lines.push(''); continue; }
-      const raw = atob(rowEntry.data);
-      let lineText = '';
-      for (let c = 0; c < cols; c++) {
-        const offset = c * 12;
-        if (offset + 4 > raw.length) break;
-        const cp = raw.charCodeAt(offset)
-          | (raw.charCodeAt(offset + 1) << 8)
-          | (raw.charCodeAt(offset + 2) << 16)
-          | (raw.charCodeAt(offset + 3) << 24);
-        lineText += cp > 0 ? String.fromCodePoint(cp) : ' ';
-      }
-      lines.push(lineText.trimEnd());
-    }
+    for (let r = startRow; r < rows; r++) lines.push(decodeRow(rowsData[r], cols));
 
     while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     if (lines.length === 0) return;
@@ -3298,11 +3402,11 @@ function syncPointer() {
 // ============================================================
 // Input handler
 // ============================================================
-hecaton.on('window_resized', (params) => {
-  termCols = params.cols || termCols;
-  termRows = params.rows || termRows;
-  rerender();
-});
+// Window state (size, minimized) is forwarded by the dashboard through resize()
+// and setMinimized(). Subscribing here as well would be worse than redundant:
+// the runner replays a notification that arrived before anyone listened to the
+// first subscriber only, and this module subscribes first — the dashboard would
+// start in normal mode inside a minimized bar.
 hecaton.on('locale_changed', (params) => {
   setUiLocale(params?.locale);
   appliedTooltip = null;
@@ -3334,17 +3438,6 @@ hecaton.on('terminal_changed', (params) => {
 });
 hecaton.on('dialog_resolved', (params) => {
   onDialogResult(params.button_id);
-});
-hecaton.on('window_minimized', () => {
-  minimized = true;
-  hoverRow = -1;
-  hoverCol = -1;
-  appliedTooltip = null;
-  rerender();
-});
-hecaton.on('window_restored', () => {
-  minimized = false;
-  rerender();
 });
 
 // ============================================================
@@ -3824,6 +3917,20 @@ return {
   },
   render: rerender,
   input: handleInput,
+  resize(cols, rows) {
+    termCols = cols || termCols;
+    termRows = rows || termRows;
+    rerender();
+  },
+  setMinimized(value) {
+    minimized = value;
+    if (value) {
+      hoverRow = -1;
+      hoverCol = -1;
+      appliedTooltip = null;
+    }
+    rerender();
+  },
   // Closing stdin prevents RPC replies, so issue all release requests before exit.
   async dispose() {
     if (disposed) return;

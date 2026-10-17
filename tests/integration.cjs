@@ -7,7 +7,7 @@ const { EventEmitter } = require('node:events');
 const root = path.resolve(__dirname, '..');
 const flush = async () => { for (let i = 0; i < 20; i++) await new Promise(setImmediate); };
 
-async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200, permission = 'granted', notifySend, deny = [], serviceFailure } = {}) {
+async function harness({ legacy, serve, locale, envLocale, cols = 100, authenticated = false, usageStatus = 200, permission = 'granted', notifySend, deny = [], serviceFailure, cells, minimized = false, early = [] } = {}) {
   const events = new EventEmitter();
   const serviceEvents = new EventEmitter();
   let serviceHandlers, serviceShutdown;
@@ -31,8 +31,14 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
       };
       return channel;
     },
-    initialState: { cols, rows: 40, minimized: false, locale },
-    on: (name, fn) => events.on(name, fn),
+    initialState: { cols, rows: minimized ? 1 : 40, minimized, locale },
+    // Like the runner: a window-state notification that arrived before anyone
+    // listened is replayed once, to the first subscriber only.
+    on: (name, fn) => {
+      events.on(name, fn);
+      const i = early.findIndex(([event]) => event === name);
+      if (i >= 0) fn(early.splice(i, 1)[0][1]);
+    },
   }, {
     get(target, ns) {
       if (ns in target) return target[ns];
@@ -41,7 +47,7 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
         if (deny.includes(`${ns}.${verb}`)) return { ok: false, error_code: 'access_denied' };
         if (ns === 'env') {
           if (verb === 'get_home') return { path: '/home' };
-          return { value: { HECA_COLS: String(cols), HECA_ROWS: '40', HECA_LOCALE: envLocale, HECA_PLUGIN_DATA_DIR: '/home/.hecaton/data/dev.hecaton.claude-dashboard' }[args.name] || '' };
+          return { value: { HECA_COLS: String(cols), HECA_ROWS: minimized ? '1' : '40', HECA_MINIMIZED: minimized ? '1' : '', HECA_LOCALE: envLocale, HECA_PLUGIN_DATA_DIR: '/home/.hecaton/data/dev.hecaton.claude-dashboard' }[args.name] || '' };
         }
         if (ns === 'fs' && verb === 'read_file') {
           if (args.path.endsWith('/plugin.json')) return { ok: true, content: fs.readFileSync(path.join(root, 'plugin.json'), 'utf8') };
@@ -60,6 +66,7 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
         if (ns === 'web' && verb === 'serve') return serve ? serve() : { ok: true, server_id: 7, port: 9218 };
         if (ns === 'terminal' && verb === 'list') return { terminals: [{ id: 42, title: 'test project' }] };
         if (ns === 'terminal' && verb === 'subscribe') return { subscription_id: 9 };
+        if (ns === 'terminal' && verb === 'get_cells' && cells) return cells(args);
         if (ns === 'http') {
           if (authenticated && args.url.includes('/oauth/usage')) return { ok: true, status: usageStatus,
             body: JSON.stringify({ five_hour: { utilization: 25, resets_at: '2099-01-01T00:00:00Z' },
@@ -95,7 +102,16 @@ async function harness({ legacy, serve, locale, envLocale, cols = 100, authentic
   const emit = async (name, data) => { events.emit(name, data); if (['http_request_received', 'ws_connected', 'ws_message_received', 'ws_disconnected', 'terminal_changed', 'locale_changed'].includes(name)) serviceEvents.emit(name, data); await flush(); };
   const input = async key => { stdin.emit('data', key); await flush(); };
   const hook = async event => emit('http_request_received', { method: 'POST', path: '/hook', body: JSON.stringify({ client: 'claude', terminal_id: 42, event }) });
-  return { calls, output, files, emit, input, hook, stdin, timers, textHelpers, connectClient: options => host.serviceChannel(options), shutdownService: () => serviceShutdown(), serviceHandlers, setPermission: next => { permissionState = next; }, frame: () => output.join('').split('\x1b[2J').at(-1) };
+  // Fires timers set after `since` (the mock never runs them on its own); recurring
+  // dashboard timers would reschedule forever, so this stops after a few rounds.
+  const runTimers = async since => { for (let round = 0; round < 10; round++) {
+    const due = [...timers].filter(([id]) => id > since);
+    if (!due.length) return;
+    for (const [id, fn] of due) { timers.delete(id); fn(); }
+    await flush();
+  } };
+  const lastTimer = () => timer;
+  return { calls, output, files, emit, input, hook, stdin, timers, runTimers, lastTimer, textHelpers, connectClient: options => host.serviceChannel(options), shutdownService: () => serviceShutdown(), serviceHandlers, setPermission: next => { permissionState = next; }, frame: () => output.join('').split('\x1b[2J').at(-1) };
 }
 
 test('reopening and multiple clients share state, settings and a single listener', async () => {
@@ -415,6 +431,85 @@ test('turn boundaries bookmark the hooked terminal even when that notification i
   assert.match(marks[0].args.comment, /Turn time: \d+s/);
   assert.doesNotMatch(marks[1].args.comment, /Turn time/, 'the turn ended at Stop; the next one has not started');
   assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 0, 'neither event notifies with these settings');
+});
+
+test('a window_minimized that arrived during startup is not lost to the agent view', async () => {
+  for (const h of [await harness({ early: [['window_minimized', {}]] }), await harness({ minimized: true })]) {
+    assert.doesNotMatch(h.frame(), /\[1\]/, 'no navigation tabs in the minimized bar');
+    assert.doesNotMatch(h.frame(), /\x1b\[([2-9]|\d\d);\d+H/, 'only the bar row is drawn');
+    await h.input('2');
+    assert.doesNotMatch(h.frame(), /Claude State/, 'keys do not open the agent view while minimized');
+    await h.emit('window_restored', {});
+    await h.emit('window_resized', { cols: 100, rows: 40 });
+    assert.match(h.frame(), /\[1\]/);
+    await h.input('2');
+    assert.match(h.frame(), /Claude State/, 'the agent view knows the window is restored');
+    await h.emit('window_minimized', {});
+    assert.doesNotMatch(h.frame(), /Claude State/);
+  }
+});
+
+// A get_cells reply: 12-byte cells whose first 4 bytes are the UTF-32 LE code point.
+function screen(text, cursorY, cols = 60) {
+  const lines = text.split('\n');
+  const rows_data = {};
+  lines.forEach((line, r) => {
+    const buf = Buffer.alloc(cols * 12);
+    [...line].slice(0, cols).forEach((ch, c) => buf.writeUInt32LE(ch.codePointAt(0), c * 12));
+    rows_data[r] = buf.toString('base64');
+  });
+  return { version: 1, cols, rows: lines.length, cursor_x: 2, cursor_y: cursorY, full: true, rows_data };
+}
+const RULE = '─'.repeat(60);
+// What Claude Code shows when the Stop hook fires, and a moment later.
+const DRAWING = screen(['❯ Say hello', '⏺ Bash(ls)', '⏺ Hello', '  there', '', '✢ Mulling… (running Stop hooks… 1/2 · 1s)',
+  '', RULE, '❯', RULE, '  ⏵⏵ auto mode on · esc to interrupt'].join('\n'), 8);
+const SETTLED = screen(['❯ Say hello', '⏺ Bash(ls)', '⏺ Hello', '  there', '', '✻ Churned for 1s · done 8:20 PM',
+  '', RULE, '❯', RULE, '  ⏵⏵ auto mode on'].join('\n'), 8);
+
+test('a finished turn bookmarks every line of its final reply once the screen settles', async () => {
+  const replies = [DRAWING, SETTLED];
+  const h = await harness({ cells: () => replies.shift() || SETTLED });
+  await h.hook('UserPromptSubmit');
+  const before = h.lastTimer();
+  await h.hook('Stop');
+  assert.equal(h.calls.filter(c => c.method === 'notify.send').length, 1, 'the notification does not wait for the screen');
+  assert.equal(h.calls.filter(c => c.method === 'terminal.add_bookmark').length, 0, 'the spinner is still drawn');
+  await h.runTimers(before);
+  const [mark] = h.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.deepEqual(h.calls.filter(c => c.method === 'terminal.get_cells').map(c => c.args.terminal_id), [42, 42]);
+  assert.equal(mark.args.row_offset, -6, 'starts at the last message, not the tool call or prompt');
+  assert.equal(mark.args.lines, 2);
+  assert.match(mark.args.comment, /Turn time: \d+s/, 'built before the turn start was dropped');
+});
+
+test('bookmark placement clips tall replies and falls back when the screen cannot be read', async () => {
+  const scrolled = await harness({ cells: () => screen(['  12', '  13', '', '✻ Brewed for 9s', '', RULE, '❯', RULE].join('\n'), 6) });
+  await scrolled.hook('Stop');
+  const [tall] = scrolled.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.deepEqual([tall.args.row_offset, tall.args.lines], [-6, 2], 'a reply taller than the screen is marked from the top row');
+
+  const bare = await harness({ cells: () => screen(['❯ hi', '  odd', '', '✻ Brewed for 9s', '', RULE, '❯', RULE].join('\n'), 6) });
+  await bare.hook('Stop');
+  const [last] = bare.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.deepEqual([last.args.row_offset, last.args.lines], [-5, 1], 'no message bullet: only the reply end is known');
+
+  const denied = await harness({ deny: ['terminal.get_cells'] });
+  await denied.hook('Stop');
+  await denied.hook('UserPromptSubmit');
+  await denied.hook('StopFailure');
+  assert.equal(denied.calls.filter(c => c.method === 'terminal.get_cells').length, 1, 'a refusal is not re-asked');
+  const marks = denied.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.equal(marks.length, 2);
+  assert.ok(marks.every(m => m.args.row_offset === undefined), 'cursor row as before');
+
+  const other = await harness({ cells: () => screen('$ ls\nfile.txt', 1) });
+  const before = other.lastTimer();
+  await other.hook('PermissionRequest');
+  await other.hook('Stop');
+  assert.equal(other.calls.filter(c => c.method === 'terminal.get_cells').length, 1, 'only turn ends read the screen');
+  assert.equal(other.calls.filter(c => c.method === 'terminal.add_bookmark').length, 2);
+  assert.equal([...other.timers.keys()].filter(id => id > before).length, 0, 'a screen that is not Claude Code is not polled');
 });
 
 test('bookmarks can be turned off and a refusal stops further requests', async () => {

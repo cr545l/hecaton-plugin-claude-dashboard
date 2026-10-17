@@ -48,8 +48,8 @@
       "ko": "Claude가 작업 중인 터미널에 실행 중·대기·차단 배지를 표시하고 세션이 끝나면 배지를 지우며, 작업이 끝나거나 승인을 기다리며 멈춘 지점을 그 터미널에 북마크로 남깁니다."
     },
     "cross_terminal": {
-      "en": "Read the last lines drawn on the terminal screen to recognise the Claude prompt when you turn pattern matching on. This is the fallback for when hooks are unavailable and it stays off until you start it.",
-      "ko": "패턴 감지를 켰을 때 터미널 화면에 그려진 마지막 줄들을 읽어 Claude 프롬프트를 인식합니다. 훅을 쓸 수 없을 때를 위한 대체 수단이며 직접 시작하기 전까지는 꺼져 있습니다."
+      "en": "Read the screen of the terminal where a Claude turn just finished so its bookmark covers that turn instead of the input box, and read the last lines drawn on the terminal screen to recognise the Claude prompt when you turn pattern matching on. Pattern matching is the fallback for when hooks are unavailable and stays off until you start it.",
+      "ko": "Claude 작업이 끝난 터미널의 화면을 읽어 북마크가 입력창이 아닌 해당 작업 영역을 가리키게 하고, 패턴 감지를 켰을 때 터미널 화면에 그려진 마지막 줄들을 읽어 Claude 프롬프트를 인식합니다. 패턴 감지는 훅을 쓸 수 없을 때를 위한 대체 수단이며 직접 시작하기 전까지는 꺼져 있습니다."
     }
   }
 }
