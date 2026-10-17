@@ -176,7 +176,8 @@ const UI_CATALOGS = {
     "bookmark.comment.when": "{message} at {time}",
     "bookmark.comment.terminal": "Terminal: {name}",
     "bookmark.comment.model": "Model: {model}",
-    "bookmark.comment.turn": "Turn time: {duration}"
+    "bookmark.comment.turn": "Turn time: {duration}",
+    "bookmark.comment.reply": "Reply:"
   },
   "ko": {
     "permission.reason.service": "훅 서버와 에이전트 상태·북마크·알림을 하나의 백그라운드 서비스에서 처리합니다. 마지막 창을 닫은 뒤 최대 10분간 유지합니다.",
@@ -353,7 +354,8 @@ const UI_CATALOGS = {
     "bookmark.comment.when": "{time}에 {message}",
     "bookmark.comment.terminal": "터미널: {name}",
     "bookmark.comment.model": "모델: {model}",
-    "bookmark.comment.turn": "작업 시간: {duration}"
+    "bookmark.comment.turn": "작업 시간: {duration}",
+    "bookmark.comment.reply": "응답:"
   }
 };
 // Catalogs are embedded by scripts/build.cjs; the host needs only main.js.
@@ -2752,7 +2754,8 @@ const MESSAGE_RE = /^[⏺●] /;
 // null = not decided yet; a string is why screen reads are off for this run.
 let screenReadUnavailable = null;
 
-// Each cell is 12 bytes and starts with its UTF-32 LE code point. The host
+// Each cell is 12 bytes and starts with its UTF-32 LE code point; byte 10
+// holds flags, 0x80 marking the second half of a double-width glyph. The host
 // sends each row as a base64 string.
 function decodeRow(entry, cols) {
   const data = typeof entry === 'string' ? entry : entry && entry.data;
@@ -2762,6 +2765,7 @@ function decodeRow(entry, cols) {
   for (let c = 0; c < cols; c++) {
     const offset = c * 12;
     if (offset + 4 > raw.length) break;
+    if (raw.charCodeAt(offset + 10) & 0x80) continue;
     const cp = raw.charCodeAt(offset)
       | (raw.charCodeAt(offset + 1) << 8)
       | (raw.charCodeAt(offset + 2) << 16)
@@ -2796,6 +2800,39 @@ function locateTurn(lines, cursorY) {
   return { settled: true, start: 0, end, clipped: true };
 }
 
+// ── Reply excerpt in the comment ──
+// The host caps a comment at 4096 UTF-8 bytes; the excerpt gets what the
+// details above it leave over.
+const COMMENT_MAX_BYTES = 4096;
+
+function utf8Length(ch) {
+  const cp = ch.codePointAt(0);
+  return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+}
+
+// Screen rows as the reader wrote them: no message bullet, no reply indent.
+function replyText(rows) {
+  const text = rows.map(line => line.replace(MESSAGE_RE, '').replace(/^ {2}/, '')
+    .replace(/[\x00-\x08\x0a-\x1f\x7f]/g, '')).join('\n');
+  return text.replace(/\s+$/, '');
+}
+
+function commentWithReply(comment, reply, clipped) {
+  if (!reply) return comment;
+  const head = comment + '\n\n' + tr('bookmark.comment.reply') + '\n' + (clipped ? '…\n' : '');
+  let bytes = 0;
+  for (const ch of head) bytes += utf8Length(ch);
+  let body = '';
+  for (const ch of reply) {
+    const size = utf8Length(ch);
+    // Keep room for the trailing "…" (3 bytes) of a cut reply.
+    if (bytes + size > COMMENT_MAX_BYTES - 3) return bytes > COMMENT_MAX_BYTES - 3 ? comment : head + body + '…';
+    bytes += size;
+    body += ch;
+  }
+  return head + body;
+}
+
 // Bookmark placement relative to the cursor, or null to fall back to the cursor row.
 async function locateBookmark(terminalId) {
   if (screenReadUnavailable || typeof hecaton.terminal?.get_cells !== 'function') return null;
@@ -2816,7 +2853,8 @@ async function locateBookmark(terminalId) {
     if (turn.settled) {
       const count = turn.end - turn.start + 1;
       addLog(`T${terminalId} bookmark covers ${count} line(s)${turn.clipped ? ' from the screen top' : ''}`);
-      return { row_offset: turn.start - cells.cursor_y, lines: count };
+      return { row_offset: turn.start - cells.cursor_y, lines: count,
+        reply: replyText(lines.slice(turn.start, turn.end + 1)), clipped: !!turn.clipped };
     }
   }
   addLog(`T${terminalId} turn end never settled on screen — bookmark at cursor`);
@@ -2833,7 +2871,7 @@ async function addTerminalBookmark(terminalId, agent, key, info) {
   }
   // Built before locating: the turn's start time is dropped once this returns control.
   const label = bookmarkLabel(agent, key);
-  const comment = bookmarkComment(terminalId, key, { ...info, agent });
+  let comment = bookmarkComment(terminalId, key, { ...info, agent });
   try {
     let placement = null;
     try {
@@ -2841,7 +2879,13 @@ async function addTerminalBookmark(terminalId, agent, key, info) {
     } catch (e) {
       addLog(`T${terminalId} screen read failed: ${e && e.message ? e.message : e}`);
     }
-    const r = await hecaton.terminal.add_bookmark({ terminal_id: terminalId, label, comment, ...placement });
+    const range = {};
+    if (placement) {
+      range.row_offset = placement.row_offset;
+      range.lines = placement.lines;
+      comment = commentWithReply(comment, placement.reply, placement.clipped);
+    }
+    const r = await hecaton.terminal.add_bookmark({ terminal_id: terminalId, label, comment, ...range });
     if (r && r.ok === false) {
       // Same grant as the badge; a refusal is stored by the host, so stop asking.
       if (r.error_code === 'access_denied') bookmarksUnavailable = 'access_denied';

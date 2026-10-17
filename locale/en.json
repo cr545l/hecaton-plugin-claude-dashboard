@@ -173,5 +173,6 @@
   "bookmark.comment.when": "{message} at {time}",
   "bookmark.comment.terminal": "Terminal: {name}",
   "bookmark.comment.model": "Model: {model}",
-  "bookmark.comment.turn": "Turn time: {duration}"
+  "bookmark.comment.turn": "Turn time: {duration}",
+  "bookmark.comment.reply": "Reply:"
 }

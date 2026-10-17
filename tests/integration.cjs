@@ -449,13 +449,19 @@ test('a window_minimized that arrived during startup is not lost to the agent vi
   }
 });
 
-// A get_cells reply: 12-byte cells whose first 4 bytes are the UTF-32 LE code point.
+// A get_cells reply: 12-byte cells whose first 4 bytes are the UTF-32 LE code
+// point. A Hangul glyph takes two cells, the second flagged 0x80 in byte 10.
 function screen(text, cursorY, cols = 60) {
   const lines = text.split('\n');
   const rows_data = {};
   lines.forEach((line, r) => {
     const buf = Buffer.alloc(cols * 12);
-    [...line].slice(0, cols).forEach((ch, c) => buf.writeUInt32LE(ch.codePointAt(0), c * 12));
+    let c = 0;
+    for (const ch of line) {
+      if (c >= cols) break;
+      buf.writeUInt32LE(ch.codePointAt(0), c++ * 12);
+      if (/[\uac00-\ud7a3]/.test(ch) && c < cols) buf[c++ * 12 + 10] = 0x80;
+    }
     rows_data[r] = buf.toString('base64');
   });
   return { version: 1, cols, rows: lines.length, cursor_x: 2, cursor_y: cursorY, full: true, rows_data };
@@ -464,7 +470,7 @@ const RULE = '─'.repeat(60);
 // What Claude Code shows when the Stop hook fires, and a moment later.
 const DRAWING = screen(['❯ Say hello', '⏺ Bash(ls)', '⏺ Hello', '  there', '', '✢ Mulling… (running Stop hooks… 1/2 · 1s)',
   '', RULE, '❯', RULE, '  ⏵⏵ auto mode on · esc to interrupt'].join('\n'), 8);
-const SETTLED = screen(['❯ Say hello', '⏺ Bash(ls)', '⏺ Hello', '  there', '', '✻ Churned for 1s · done 8:20 PM',
+const SETTLED = screen(['❯ Say hello', '⏺ Bash(ls)', '⏺ Hello', '  안녕하세요', '', '✻ Churned for 1s · done 8:20 PM',
   '', RULE, '❯', RULE, '  ⏵⏵ auto mode on'].join('\n'), 8);
 
 test('a finished turn bookmarks every line of its final reply once the screen settles', async () => {
@@ -481,6 +487,18 @@ test('a finished turn bookmarks every line of its final reply once the screen se
   assert.equal(mark.args.row_offset, -6, 'starts at the last message, not the tool call or prompt');
   assert.equal(mark.args.lines, 2);
   assert.match(mark.args.comment, /Turn time: \d+s/, 'built before the turn start was dropped');
+  assert.match(mark.args.comment, /\n\nReply:\nHello\n안녕하세요$/, 'the reply follows the details, without bullet or indent');
+});
+
+test('a reply excerpt is cut to fit the comment limit', async () => {
+  // About 9 KB of Hangul on a wide screen.
+  const body = Array.from({ length: 30 }, () => '  ' + '가'.repeat(99));
+  const h = await harness({ cells: () => screen(['⏺ 시작', ...body, '', '✻ Brewed for 9s', '', RULE, '❯', RULE].join('\n'), body.length + 5, 200) });
+  await h.hook('Stop');
+  const [mark] = h.calls.filter(c => c.method === 'terminal.add_bookmark');
+  assert.equal(mark.args.lines, 31);
+  assert.ok(Buffer.byteLength(mark.args.comment) <= 4096, `comment is ${Buffer.byteLength(mark.args.comment)} bytes`);
+  assert.match(mark.args.comment, /Reply:\n시작\n가+[\s\S]*…$/);
 });
 
 test('bookmark placement clips tall replies and falls back when the screen cannot be read', async () => {
@@ -488,6 +506,7 @@ test('bookmark placement clips tall replies and falls back when the screen canno
   await scrolled.hook('Stop');
   const [tall] = scrolled.calls.filter(c => c.method === 'terminal.add_bookmark');
   assert.deepEqual([tall.args.row_offset, tall.args.lines], [-6, 2], 'a reply taller than the screen is marked from the top row');
+  assert.match(tall.args.comment, /Reply:\n…\n12\n13$/, 'a clipped reply says so');
 
   const bare = await harness({ cells: () => screen(['❯ hi', '  odd', '', '✻ Brewed for 9s', '', RULE, '❯', RULE].join('\n'), 6) });
   await bare.hook('Stop');

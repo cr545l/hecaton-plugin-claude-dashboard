@@ -173,5 +173,6 @@
   "bookmark.comment.when": "{time}에 {message}",
   "bookmark.comment.terminal": "터미널: {name}",
   "bookmark.comment.model": "모델: {model}",
-  "bookmark.comment.turn": "작업 시간: {duration}"
+  "bookmark.comment.turn": "작업 시간: {duration}",
+  "bookmark.comment.reply": "응답:"
 }
